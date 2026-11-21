@@ -9,3 +9,6 @@ public/
 *.log
 .DS_Store
 .vercel
+
+.vercel
+.env*

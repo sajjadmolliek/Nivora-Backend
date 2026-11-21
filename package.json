@@ -14,7 +14,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "vercel-build": "npm install --prefix admin --no-audit --no-fund && npm --prefix admin run build && npm run build && node scripts/prepare-admin.mjs",
+    "vercel-build": "npm install --prefix admin --include=dev --no-audit --no-fund && npm --prefix admin run build && npm run build && node scripts/prepare-admin.mjs",
     "seed": "cross-env NODE_ENV=development DB_MEMORY=1 SEED=1 tsx src/server.ts"
   },
   "dependencies": {
