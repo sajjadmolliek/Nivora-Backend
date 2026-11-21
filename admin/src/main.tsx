@@ -1376,9 +1376,15 @@ function ProductsAdminPage() {
               <Field label="Tags" hint="Comma separated, e.g. kurti-set, new">
                 <input value={draft.tags} onChange={(e) => updateDraft({ tags: e.target.value })} />
               </Field>
-              <Field label="Pictures" className="full" hint="Upload from this device or paste a link. First picture is the cover — up to 8.">
-                <ImagePicker value={draft.images} onChange={(images) => updateDraft({ images })} max={8} />
-              </Field>
+              <div className="field full">
+                <span className="field-label">Pictures</span>
+                <ImagePicker
+                  value={draft.images}
+                  onChange={(images) => updateDraft({ images })}
+                  max={8}
+                  hint="Upload from this device or paste a link. First picture is the cover — up to 8."
+                />
+              </div>
               <Field label="Description" className="full">
                 <textarea maxLength={6000} value={draft.description} onChange={(e) => updateDraft({ description: e.target.value })} />
               </Field>
@@ -1614,13 +1620,15 @@ function CategoriesAdminPage() {
             <Field label="Description">
               <input maxLength={300} value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} />
             </Field>
-            <Field label="Cover picture" hint="Upload from this device or paste a link.">
+            <div className="field">
+              <span className="field-label">Cover picture</span>
               <ImagePicker
                 value={draft.image ? [draft.image] : []}
                 onChange={(next) => setDraft({ ...draft, image: next[0] ?? '' })}
                 max={1}
+                hint="Upload from this device or paste a link."
               />
-            </Field>
+            </div>
             <div className="form-grid">
               <Field label="Sort order">
                 <input type="number" min="0" max="999" value={draft.sortOrder} onChange={(e) => setDraft({ ...draft, sortOrder: e.target.value })} />
