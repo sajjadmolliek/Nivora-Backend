@@ -281,8 +281,10 @@ const UserSchema = new Schema(
   {
     name: { type: String, required: true, trim: true, maxlength: 80 },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
-    phone: { type: String, required: true, maxlength: 20 },
-    passwordHash: { type: String, required: true, select: false },
+    // Google sign-in accounts start without a phone or a password.
+    phone: { type: String, default: '', maxlength: 20 },
+    passwordHash: { type: String, default: null, select: false },
+    googleId: { type: String, unique: true, sparse: true },
     role: { type: String, enum: ['customer', 'manager', 'admin'], default: 'customer', index: true },
     addresses: { type: [AddressSchema], default: [] },
     isActive: { type: Boolean, default: true },
@@ -1171,7 +1173,8 @@ api.post('/auth/login', authLimiter, asyncRoute(async (req, res) => {
   }
   if (!user.isActive) throw new ApiError(403, 'This account has been disabled.', 'account_disabled');
 
-  const ok = await bcrypt.compare(body.password, user.passwordHash);
+  // Google-only accounts have no password to compare against.
+  const ok = user.passwordHash ? await bcrypt.compare(body.password, user.passwordHash) : false;
   if (!ok) {
     const failed = (user.failedLogins ?? 0) + 1;
     const lock = failed >= 8 ? new Date(Date.now() + 15 * 60 * 1000) : null;
@@ -1184,6 +1187,58 @@ api.post('/auth/login', authLimiter, asyncRoute(async (req, res) => {
   setAccessCookie(res, user);
   await issueRefreshToken(req, res, user._id);
   await audit(req, 'auth.login', 'user', String(user._id));
+  res.json({ user: publicUser(user) });
+}));
+
+/* Google sign-in. The browser gets an ID token from Google Identity Services
+ * and posts it here; the token is verified with Google before a session is
+ * issued, so the client can never just claim an email address. */
+const GOOGLE_TOKENINFO = 'https://oauth2.googleapis.com/tokeninfo';
+
+api.post('/auth/google', authLimiter, asyncRoute(async (req, res) => {
+  const clientId = (process.env.GOOGLE_CLIENT_ID ?? '').trim();
+  if (!clientId) throw new ApiError(503, 'Google sign-in is not configured on this server.', 'google_unavailable');
+  const { credential } = z.object({ credential: z.string().trim().min(20).max(4096) }).parse(req.body);
+
+  let info: { aud?: string; iss?: string; exp?: string; email?: string; email_verified?: string | boolean; name?: string; sub?: string };
+  try {
+    const upstream = await fetch(`${GOOGLE_TOKENINFO}?id_token=${encodeURIComponent(credential)}`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!upstream.ok) throw new Error(`tokeninfo ${upstream.status}`);
+    info = (await upstream.json()) as typeof info;
+  } catch {
+    throw new ApiError(401, 'Google could not verify that sign-in. Please try again.', 'bad_google_token');
+  }
+
+  if (info.aud !== clientId) throw new ApiError(401, 'That Google token was issued for another app.', 'bad_google_token');
+  if (info.iss !== 'accounts.google.com' && info.iss !== 'https://accounts.google.com') {
+    throw new ApiError(401, 'That Google token could not be trusted.', 'bad_google_token');
+  }
+  if (!info.sub || !info.email) throw new ApiError(401, 'Google did not share an email address.', 'bad_google_token');
+  if (!(info.email_verified === true || info.email_verified === 'true')) {
+    throw new ApiError(401, 'Your Google email is not verified.', 'email_unverified');
+  }
+
+  const email = info.email.toLowerCase();
+  let user = await User.findOne({ email });
+  if (user) {
+    if (!user.isActive) throw new ApiError(403, 'This account has been disabled.', 'account_disabled');
+    if (!user.googleId) await User.updateOne({ _id: user._id }, { $set: { googleId: info.sub } });
+  } else {
+    user = await User.create({
+      name: (info.name ?? email.split('@')[0] ?? 'Customer').slice(0, 80),
+      email,
+      googleId: info.sub,
+      role: 'customer',
+      lastLoginAt: new Date(),
+    });
+  }
+
+  await User.updateOne({ _id: user._id }, { $set: { lastLoginAt: new Date() } });
+  setAccessCookie(res, user);
+  await issueRefreshToken(req, res, user._id);
+  await audit(req, 'auth.google_login', 'user', String(user._id));
   res.json({ user: publicUser(user) });
 }));
 
@@ -1261,7 +1316,7 @@ api.post('/auth/password', writeLimiter, requireAuth, asyncRoute(async (req, res
   assertStrongPassword(body.newPassword);
   const user = await User.findById(req.user!._id).select('+passwordHash');
   if (!user) throw new ApiError(401, 'Please sign in again.', 'unauthorized');
-  const ok = await bcrypt.compare(body.currentPassword, user.passwordHash);
+  const ok = user.passwordHash ? await bcrypt.compare(body.currentPassword, user.passwordHash) : false;
   if (!ok) throw new ApiError(400, 'Current password is incorrect.', 'bad_credentials');
   user.passwordHash = await bcrypt.hash(body.newPassword, BCRYPT_COST);
   user.tokenVersion += 1; // revoke every existing session
