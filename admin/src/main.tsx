@@ -290,6 +290,21 @@ async function shrinkImage(file: File, maxWidth = 1600): Promise<Blob> {
   return blob;
 }
 
+/** Upload a picture chosen from this device; the API stores the bytes. */
+async function uploadImageFile(file: File, maxWidth = 1600): Promise<string> {
+  const blob = await shrinkImage(file, maxWidth);
+  const token = await csrfToken();
+  const res = await fetch(apiUrl('/admin/images'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': blob.type || 'image/jpeg', 'x-csrf-token': token },
+    body: blob,
+  });
+  const data = (await res.json().catch(() => null)) as { url?: string; error?: string } | null;
+  if (!res.ok || !data?.url) throw new Error(data?.error ?? 'Could not upload that image.');
+  return data.url;
+}
+
 /* =============================================================================
  * 3. API CLIENT — cookies + CSRF double-submit + silent refresh
  * ========================================================================== */
@@ -642,6 +657,107 @@ function Modal({
   );
 }
 
+/** Picture field: thumbnails, upload from this device, or paste a link. */
+function ImagePicker({
+  value,
+  onChange,
+  max = 8,
+  hint,
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  max?: number;
+  hint?: string;
+}) {
+  const { notify } = useToast();
+  const [busy, setBusy] = useState(false);
+  const [link, setLink] = useState('');
+
+  async function pick(files: FileList | null) {
+    if (!files?.length) return;
+    if (value.length >= max) {
+      notify(`You can add up to ${max} picture(s).`, 'error');
+      return;
+    }
+    const chosen = Array.from(files).slice(0, max - value.length);
+    setBusy(true);
+    const added: string[] = [];
+    try {
+      for (const file of chosen) added.push(await uploadImageFile(file));
+      onChange([...value, ...added]);
+      notify(added.length > 1 ? `${added.length} pictures uploaded.` : 'Picture uploaded.', 'success');
+    } catch (err) {
+      if (added.length) onChange([...value, ...added]);
+      notify(err instanceof Error ? err.message : 'Could not upload that image.', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="image-picker">
+      {value.length > 0 && (
+        <div className="image-picker-grid">
+          {value.map((url, i) => (
+            <div key={`${url}-${i}`} className="image-picker-thumb">
+              <img src={assetUrl(url)} alt={`Picture ${i + 1}`} />
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Remove picture"
+                onClick={() => onChange(value.filter((_, idx) => idx !== i))}
+              >
+                ✕
+              </button>
+              {i === 0 && max > 1 && <span className="image-picker-tag">Cover</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="row">
+        <label className="btn btn-outline btn-sm" style={{ cursor: busy ? 'progress' : 'pointer' }}>
+          {busy ? 'Uploading…' : 'Upload from this device'}
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            hidden
+            multiple={max > 1}
+            disabled={busy}
+            onChange={(e) => {
+              const files = e.target.files;
+              e.target.value = '';
+              void pick(files);
+            }}
+          />
+        </label>
+        {value.length < max && (
+          <>
+            <input
+              placeholder="…or paste an image link"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              style={{ flex: '1 1 220px' }}
+            />
+            <Button
+              type="button"
+              variant="subtle"
+              size="sm"
+              disabled={!link.trim()}
+              onClick={() => {
+                onChange([...value, link.trim()]);
+                setLink('');
+              }}
+            >
+              Use this link
+            </Button>
+          </>
+        )}
+      </div>
+      {hint && <span className="field-hint">{hint}</span>}
+    </div>
+  );
+}
+
 function Price({ value, compare }: { value: number; compare?: number }) {
   return (
     <span className="price">
@@ -653,7 +769,7 @@ function Price({ value, compare }: { value: number; compare?: number }) {
 
 function ProductImage({ product, className }: { product: Pick<Product, 'images' | 'name'>; className?: string }) {
   const [broken, setBroken] = useState(false);
-  const src = product.images[0]?.url ?? '';
+  const src = assetUrl(product.images[0]?.url ?? '');
   if (!src || broken) {
     return (
       <div className={cx('img-fallback', className)} aria-label={product.name}>
@@ -965,7 +1081,7 @@ interface ProductDraft {
   slug: string;
   description: string;
   category: string;
-  images: string;
+  images: string[];
   tags: string;
   isActive: boolean;
   isFeatured: boolean;
@@ -977,7 +1093,7 @@ const emptyDraft = (categoryId: string): ProductDraft => ({
   slug: '',
   description: '',
   category: categoryId,
-  images: '',
+  images: [],
   tags: '',
   isActive: true,
   isFeatured: false,
@@ -1035,7 +1151,7 @@ function ProductsAdminPage() {
       slug: p.slug,
       description: p.description,
       category: p.categoryId,
-      images: p.images.map((i) => i.url).join('\n'),
+      images: p.images.map((i) => i.url),
       tags: p.tags.join(', '),
       isActive: p.isActive !== false,
       isFeatured: p.isFeatured,
@@ -1054,11 +1170,7 @@ function ProductsAdminPage() {
     e.preventDefault();
     if (!draft) return;
     setFormError('');
-    const images = draft.images
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((url) => ({ url, alt: draft.name }));
+    const images = draft.images.map((url) => ({ url, alt: draft.name }));
     const variants = draft.variants.map((v) => ({
       ...(v._id ? { _id: v._id } : {}),
       label: v.label.trim(),
@@ -1264,8 +1376,8 @@ function ProductsAdminPage() {
               <Field label="Tags" hint="Comma separated, e.g. kurti-set, new">
                 <input value={draft.tags} onChange={(e) => updateDraft({ tags: e.target.value })} />
               </Field>
-              <Field label="Image URLs" className="full" hint="One https URL per line. First image is the cover.">
-                <textarea value={draft.images} onChange={(e) => updateDraft({ images: e.target.value })} style={{ minHeight: 78 }} />
+              <Field label="Pictures" className="full" hint="Upload from this device or paste a link. First picture is the cover — up to 8.">
+                <ImagePicker value={draft.images} onChange={(images) => updateDraft({ images })} max={8} />
               </Field>
               <Field label="Description" className="full">
                 <textarea maxLength={6000} value={draft.description} onChange={(e) => updateDraft({ description: e.target.value })} />
@@ -1502,8 +1614,12 @@ function CategoriesAdminPage() {
             <Field label="Description">
               <input maxLength={300} value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} />
             </Field>
-            <Field label="Cover image URL">
-              <input maxLength={600} value={draft.image} onChange={(e) => setDraft({ ...draft, image: e.target.value })} />
+            <Field label="Cover picture" hint="Upload from this device or paste a link.">
+              <ImagePicker
+                value={draft.image ? [draft.image] : []}
+                onChange={(next) => setDraft({ ...draft, image: next[0] ?? '' })}
+                max={1}
+              />
             </Field>
             <div className="form-grid">
               <Field label="Sort order">

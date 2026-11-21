@@ -1102,6 +1102,19 @@ api.get('/support-cover', asyncRoute(async (_req, res) => {
   res.end(bytes);
 }));
 
+/* Product and category artwork uploaded from the dashboard. Each upload gets a
+ * random key and is served from /api/asset/<key>, so the shop never hotlinks. */
+api.get('/asset/:key', asyncRoute(async (req, res) => {
+  const key = String(req.params.key ?? '').toLowerCase();
+  if (!/^[a-z0-9-]{6,80}$/.test(key)) throw new ApiError(400, 'Invalid image key.', 'bad_request');
+  const asset = await Asset.findOne({ key }).lean();
+  if (!asset) throw new ApiError(404, 'Image not found.', 'not_found');
+  const bytes = toBuffer(asset.data);
+  res.setHeader('Content-Type', asset.contentType || 'image/jpeg');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.end(bytes);
+}));
+
 api.get('/categories', asyncRoute(async (_req, res) => {
   const categories = await Category.find({ isActive: true }).sort({ sortOrder: 1, name: 1 }).lean();
   const counts = await Product.aggregate([
@@ -2132,6 +2145,24 @@ api.post(
     );
     await audit(req, 'support.cover_uploaded', 'settings', 'support-cover', { size: buffer.length, contentType });
     res.json({ url: `/api/support-cover?v=${Date.now()}` });
+  })
+);
+
+api.post(
+  '/admin/images',
+  writeLimiter,
+  staffOnly,
+  express.raw({ type: IMAGE_TYPES, limit: '4mb' }),
+  asyncRoute(async (req, res) => {
+    const buffer = Buffer.isBuffer(req.body) ? req.body : null;
+    const contentType = (req.get('content-type') ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+    if (!buffer?.length) throw new ApiError(400, 'Send the image as the raw request body.', 'bad_image');
+    if (!IMAGE_TYPES.includes(contentType)) throw new ApiError(400, 'Use a JPEG, PNG, WebP or GIF image.', 'bad_image');
+    if (buffer.length > SUPPORT_COVER_MAX) throw new ApiError(413, 'That image is larger than 4 MB.', 'too_large');
+    const key = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    await Asset.create({ key, contentType, size: buffer.length, data: buffer, updatedAt: new Date() });
+    await audit(req, 'image.uploaded', 'asset', key, { size: buffer.length, contentType });
+    res.status(201).json({ url: `/api/asset/${key}`, key });
   })
 );
 
