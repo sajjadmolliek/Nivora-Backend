@@ -286,6 +286,15 @@ const UserSchema = new Schema(
     passwordHash: { type: String, default: null, select: false },
     googleId: { type: String, unique: true, sparse: true },
     role: { type: String, enum: ['customer', 'manager', 'admin'], default: 'customer', index: true },
+    // RBAC: the main (super) admin bypasses every permission check; other staff
+    // accounts carry an explicit permission list set by their role template or
+    // per person. `permissions` stays undefined for accounts made before RBAC.
+    isSuperAdmin: { type: Boolean, default: false, index: true },
+    adminRole: { type: Schema.Types.ObjectId, ref: 'AdminRole', default: null },
+    permissions: { type: [String], default: undefined },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    suspendedAt: { type: Date, default: null },
+    suspendedReason: { type: String, default: '', maxlength: 200 },
     addresses: { type: [AddressSchema], default: [] },
     isActive: { type: Boolean, default: true },
     tokenVersion: { type: Number, default: 0 },
@@ -505,6 +514,47 @@ const AssetSchema = new Schema({
   updatedAt: { type: Date, default: Date.now },
 });
 
+/* A role is a reusable bundle of permissions. Admins can start from a role and
+ * then have their own permission list edited individually. */
+const AdminRoleSchema = new Schema(
+  {
+    name: { type: String, required: true, unique: true, trim: true, maxlength: 60 },
+    description: { type: String, default: '', maxlength: 200 },
+    permissions: { type: [String], default: [] },
+    isSystem: { type: Boolean, default: false },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  },
+  { timestamps: true }
+);
+
+/* One investor, with every amount they put in. Money is stored in poisha
+ * (integer) like the rest of the API; the dashboard formats it in taka. */
+const InvestmentEntrySchema = new Schema(
+  {
+    amount: { type: Number, required: true, min: 1 },
+    method: { type: String, default: '', maxlength: 40 },
+    note: { type: String, default: '', maxlength: 240 },
+    investedAt: { type: Date, default: () => new Date() },
+  },
+  { _id: true }
+);
+
+const InvestorSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true, maxlength: 120 },
+    phone: { type: String, default: '', maxlength: 30 },
+    email: { type: String, default: '', lowercase: true, trim: true, maxlength: 160 },
+    company: { type: String, default: '', maxlength: 120 },
+    note: { type: String, default: '', maxlength: 400 },
+    isActive: { type: Boolean, default: true },
+    investments: { type: [InvestmentEntrySchema], default: [] },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  },
+  { timestamps: true }
+);
+InvestorSchema.index({ name: 1 });
+InvestorSchema.index({ createdAt: -1 });
+
 const CounterSchema = new Schema({ _id: { type: String }, seq: { type: Number, default: 0 } });
 
 /* Models are intentionally typed as `any`: schemas enforce structure at runtime
@@ -515,6 +565,8 @@ const CounterSchema = new Schema({ _id: { type: String }, seq: { type: Number, d
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const m = (name: string, schema: mongoose.Schema): any => model(name, schema);
 const User = m('User', UserSchema);
+const AdminRole = m('AdminRole', AdminRoleSchema);
+const Investor = m('Investor', InvestorSchema);
 const RefreshToken = m('RefreshToken', RefreshTokenSchema);
 const Product = m('Product', ProductSchema);
 const Category = m('Category', CategorySchema);
@@ -542,6 +594,9 @@ interface AuthUser {
   isActive: boolean;
   tokenVersion: number;
   addresses: unknown[];
+  isSuperAdmin?: boolean;
+  permissions?: string[];
+  adminRole?: unknown;
 }
 
 declare global {
@@ -619,7 +674,7 @@ async function authenticate(req: Request, _res: Response, next: NextFunction) {
     }) as jwt.JwtPayload;
     if (payload.typ !== 'access' || typeof payload.sub !== 'string') return next();
     const user = (await User.findById(payload.sub)
-      .select('name email role isActive tokenVersion addresses')
+      .select('name email role isActive tokenVersion addresses isSuperAdmin permissions adminRole')
       .lean()) as AuthUser | null;
     if (!user || !user.isActive) return next();
     if (user.tokenVersion !== payload.tv) return next(); // tokens revoked
@@ -645,6 +700,96 @@ function requireRole(...roles: Role[]) {
 
 const staffOnly = requireRole('admin', 'manager');
 const adminOnly = requireRole('admin');
+
+/* --------------------------------------------------------------------------
+ * ROLE-BASED ACCESS CONTROL
+ * --------------------------------------------------------------------------
+ * Permissions are the single source of truth: the dashboard gates its menus
+ * with the same keys the API checks, so hiding a button is never the boundary.
+ * The main (super) admin holds everything by definition and cannot be stripped
+ * of access; every other staff account holds an explicit list.
+ * ========================================================================== */
+
+const PERMISSIONS = [
+  { key: 'dashboard.view', group: 'Overview', label: 'See revenue, orders and stock overview' },
+  { key: 'orders.view', group: 'Orders', label: 'View orders and shipping details' },
+  { key: 'orders.manage', group: 'Orders', label: 'Change order status and internal notes' },
+  { key: 'orders.payment', group: 'Orders', label: 'Verify or correct payment status' },
+  { key: 'products.view', group: 'Catalogue', label: 'View products and categories' },
+  { key: 'products.manage', group: 'Catalogue', label: 'Create, edit and archive products' },
+  { key: 'categories.manage', group: 'Catalogue', label: 'Create, edit and delete categories' },
+  { key: 'images.upload', group: 'Catalogue', label: 'Upload product and category pictures' },
+  { key: 'customers.view', group: 'Customers', label: 'View customer accounts and spend' },
+  { key: 'customers.manage', group: 'Customers', label: 'Enable, disable and re-role customers' },
+  { key: 'investors.view', group: 'Finance', label: 'See investors and how much each has invested' },
+  { key: 'investors.manage', group: 'Finance', label: 'Add investors and record their investments' },
+  { key: 'coupons.manage', group: 'Marketing', label: 'Create and edit discount coupons' },
+  { key: 'reviews.manage', group: 'Marketing', label: 'Approve or delete product reviews' },
+  { key: 'messages.manage', group: 'Marketing', label: 'Read and triage contact messages' },
+  { key: 'settings.view', group: 'Store', label: 'View store settings' },
+  { key: 'settings.manage', group: 'Store', label: 'Change store, payment and shipping settings' },
+  { key: 'admins.view', group: 'Team', label: 'View admin accounts and roles' },
+  { key: 'admins.manage', group: 'Team', label: 'Create, edit, suspend and delete admins' },
+  { key: 'roles.manage', group: 'Team', label: 'Create and edit role templates' },
+  { key: 'audit.view', group: 'Security', label: 'Read the admin activity log' },
+] as const;
+
+type Permission = (typeof PERMISSIONS)[number]['key'];
+const ALL_PERMISSIONS: string[] = PERMISSIONS.map((p) => p.key);
+
+// Staff created before RBAC keep a sensible default instead of losing access.
+const LEGACY_ADMIN_PERMISSIONS = ALL_PERMISSIONS.filter((p) => p !== 'admins.manage' && p !== 'roles.manage');
+const LEGACY_MANAGER_PERMISSIONS = [
+  'dashboard.view',
+  'orders.view',
+  'orders.manage',
+  'products.view',
+  'products.manage',
+  'images.upload',
+  'categories.manage',
+  'customers.view',
+  'coupons.manage',
+  'reviews.manage',
+  'messages.manage',
+];
+
+function effectivePermissions(user: {
+  role?: string;
+  isSuperAdmin?: boolean;
+  permissions?: unknown;
+}): string[] {
+  if (user.isSuperAdmin) return [...ALL_PERMISSIONS];
+  if (Array.isArray(user.permissions)) {
+    return (user.permissions as string[]).filter((p) => ALL_PERMISSIONS.includes(p));
+  }
+  if (user.role === 'admin') return [...LEGACY_ADMIN_PERMISSIONS];
+  if (user.role === 'manager') return [...LEGACY_MANAGER_PERMISSIONS];
+  return [];
+}
+
+/** Gate a route on one or more permissions (all must be held). */
+function requirePermission(...needed: Permission[]) {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    if (!req.user) return next(new ApiError(401, 'Please sign in to continue.', 'unauthorized'));
+    const held = effectivePermissions(req.user);
+    const missing = needed.find((p) => !held.includes(p));
+    if (missing) {
+      return next(
+        new ApiError(403, `Your account does not have the "${missing}" permission. Ask the main admin for access.`, 'forbidden')
+      );
+    }
+    return next();
+  };
+}
+const can = requirePermission;
+
+function requireSuperAdmin(req: Request, _res: Response, next: NextFunction) {
+  if (!req.user) return next(new ApiError(401, 'Please sign in to continue.', 'unauthorized'));
+  if (!req.user.isSuperAdmin) {
+    return next(new ApiError(403, 'Only the main admin can do that.', 'forbidden'));
+  }
+  return next();
+}
 
 /* ==========================================================================
  * 6. SHARED BUSINESS LOGIC
@@ -853,6 +998,9 @@ function publicUser(user: {
   phone: string;
   role: string;
   addresses?: unknown[];
+  isSuperAdmin?: boolean;
+  permissions?: unknown;
+  adminRole?: unknown;
 }) {
   return {
     id: String(user._id),
@@ -861,6 +1009,10 @@ function publicUser(user: {
     phone: user.phone,
     role: user.role,
     addresses: user.addresses ?? [],
+    // The dashboard renders menus from these; the API re-checks every call.
+    isSuperAdmin: Boolean(user.isSuperAdmin),
+    permissions: effectivePermissions(user),
+    adminRole: user.adminRole ?? null,
   };
 }
 
@@ -1426,9 +1578,19 @@ api.get('/products', asyncRoute(async (req, res) => {
     popular: { sold: -1 },
   };
 
-  const [total, docs] = await Promise.all([
+  // The slider needs the real spread of the catalogue, so measure it without
+  // the price filter itself (search / category still apply).
+  const boundsFilter = { ...filter };
+  delete boundsFilter['variants.price'];
+
+  const [total, docs, bounds] = await Promise.all([
     Product.countDocuments(filter),
     Product.find(filter).sort(sortMap[sort] ?? sortMap.newest).skip((page - 1) * limit).limit(limit).lean(),
+    Product.aggregate([
+      { $match: boundsFilter },
+      { $unwind: '$variants' },
+      { $group: { _id: null, min: { $min: '$variants.price' }, max: { $max: '$variants.price' } } },
+    ]),
   ]);
   const catIds = [...new Set(docs.map((d: any) => String(d.category)))];
   const cats = await Category.find({ _id: { $in: catIds } }).lean();
@@ -1440,6 +1602,7 @@ api.get('/products', asyncRoute(async (req, res) => {
     total,
     page,
     pages: Math.ceil(total / limit) || 1,
+    priceBounds: { min: bounds[0]?.min ?? 0, max: bounds[0]?.max ?? 0 },
   });
 }));
 
@@ -1720,7 +1883,7 @@ api.post('/contact', writeLimiter, asyncRoute(async (req, res) => {
  * 14. ROUTES — ADMIN / DASHBOARD
  * ========================================================================== */
 
-api.get('/admin/stats', staffOnly, asyncRoute(async (_req, res) => {
+api.get('/admin/stats', can('dashboard.view'), asyncRoute(async (_req, res) => {
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
   const since = new Date(Date.now() - 13 * 24 * 60 * 60 * 1000);
@@ -1780,7 +1943,7 @@ api.get('/admin/stats', staffOnly, asyncRoute(async (_req, res) => {
 }));
 
 // Products
-api.get('/admin/products', staffOnly, asyncRoute(async (req, res) => {
+api.get('/admin/products', can('products.view'), asyncRoute(async (req, res) => {
   const q = typeof req.query.q === 'string' ? clean(req.query.q).slice(0, 60) : '';
   const page = clampInt(req.query.page, 1, 1, 10_000);
   const limit = clampInt(req.query.limit, 20, 1, 100);
@@ -1805,7 +1968,7 @@ api.get('/admin/products', staffOnly, asyncRoute(async (req, res) => {
   });
 }));
 
-api.post('/admin/products', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.post('/admin/products', writeLimiter, can('products.manage'), asyncRoute(async (req, res) => {
   const body = productInput.parse(req.body);
   if (!(await Category.exists({ _id: body.category }))) throw new ApiError(400, 'Category not found.', 'bad_category');
   const baseSlug = slugify(body.slug || body.name) || `product-${Date.now()}`;
@@ -1816,7 +1979,7 @@ api.post('/admin/products', writeLimiter, staffOnly, asyncRoute(async (req, res)
   res.status(201).json({ product });
 }));
 
-api.patch('/admin/products/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/products/:id', writeLimiter, can('products.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid product id.', 'bad_request');
   const body = productInput.partial().parse(req.body);
   if (body.category && !(await Category.exists({ _id: body.category }))) {
@@ -1831,7 +1994,7 @@ api.patch('/admin/products/:id', writeLimiter, staffOnly, asyncRoute(async (req,
   res.json({ product });
 }));
 
-api.delete('/admin/products/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.delete('/admin/products/:id', writeLimiter, can('products.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid product id.', 'bad_request');
   // Soft delete keeps historical orders intact.
   const product = await Product.findByIdAndUpdate(req.params.id, { $set: { isActive: false, isFeatured: false } }, { new: true });
@@ -1841,12 +2004,12 @@ api.delete('/admin/products/:id', writeLimiter, staffOnly, asyncRoute(async (req
 }));
 
 // Categories
-api.get('/admin/categories', staffOnly, asyncRoute(async (_req, res) => {
+api.get('/admin/categories', can('products.view'), asyncRoute(async (_req, res) => {
   const categories = await Category.find().sort({ sortOrder: 1, name: 1 }).lean();
   res.json({ categories });
 }));
 
-api.post('/admin/categories', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.post('/admin/categories', writeLimiter, can('categories.manage'), asyncRoute(async (req, res) => {
   const body = z
     .object({
       name: z.string().trim().min(2).max(60),
@@ -1864,7 +2027,7 @@ api.post('/admin/categories', writeLimiter, staffOnly, asyncRoute(async (req, re
   res.status(201).json({ category });
 }));
 
-api.patch('/admin/categories/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/categories/:id', writeLimiter, can('categories.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid category id.', 'bad_request');
   const body = z
     .object({
@@ -1884,7 +2047,7 @@ api.patch('/admin/categories/:id', writeLimiter, staffOnly, asyncRoute(async (re
   res.json({ category });
 }));
 
-api.delete('/admin/categories/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.delete('/admin/categories/:id', writeLimiter, can('categories.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid category id.', 'bad_request');
   const inUse = await Product.countDocuments({ category: req.params.id, isActive: true });
   if (inUse > 0) throw new ApiError(409, `Move the ${inUse} product(s) in this category first.`, 'category_in_use');
@@ -1894,7 +2057,7 @@ api.delete('/admin/categories/:id', writeLimiter, staffOnly, asyncRoute(async (r
 }));
 
 // Orders
-api.get('/admin/orders', staffOnly, asyncRoute(async (req, res) => {
+api.get('/admin/orders', can('orders.view'), asyncRoute(async (req, res) => {
   const page = clampInt(req.query.page, 1, 1, 10_000);
   const limit = clampInt(req.query.limit, 20, 1, 100);
   const filter: Record<string, unknown> = {};
@@ -1919,7 +2082,7 @@ api.get('/admin/orders', staffOnly, asyncRoute(async (req, res) => {
   res.json({ orders, total, page, pages: Math.ceil(total / limit) || 1 });
 }));
 
-api.get('/admin/orders/:id', staffOnly, asyncRoute(async (req, res) => {
+api.get('/admin/orders/:id', can('orders.view'), asyncRoute(async (req, res) => {
   const order = isObjId(req.params.id)
     ? await Order.findById(req.params.id).lean()
     : await Order.findOne({ orderNo: String(req.params.id).toUpperCase() }).lean();
@@ -1928,7 +2091,7 @@ api.get('/admin/orders/:id', staffOnly, asyncRoute(async (req, res) => {
   res.json({ order, customer });
 }));
 
-api.patch('/admin/orders/:id/status', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/orders/:id/status', writeLimiter, can('orders.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid order id.', 'bad_request');
   const body = z
     .object({ status: z.enum(ORDER_STATUSES), note: z.string().trim().max(300).optional().default('') })
@@ -1961,7 +2124,7 @@ api.patch('/admin/orders/:id/status', writeLimiter, staffOnly, asyncRoute(async 
   res.json({ order });
 }));
 
-api.patch('/admin/orders/:id/payment', writeLimiter, adminOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/orders/:id/payment', writeLimiter, can('orders.payment'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid order id.', 'bad_request');
   const body = z
     .object({
@@ -1986,7 +2149,7 @@ api.patch('/admin/orders/:id/payment', writeLimiter, adminOnly, asyncRoute(async
   res.json({ order });
 }));
 
-api.patch('/admin/orders/:id/note', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/orders/:id/note', writeLimiter, can('orders.manage'), asyncRoute(async (req, res) => {
   const body = z.object({ adminNote: z.string().trim().max(400) }).parse(req.body);
   const order = await Order.findByIdAndUpdate(req.params.id, { $set: { adminNote: body.adminNote } }, { new: true });
   if (!order) throw new ApiError(404, 'Order not found.', 'not_found');
@@ -1994,7 +2157,7 @@ api.patch('/admin/orders/:id/note', writeLimiter, staffOnly, asyncRoute(async (r
 }));
 
 // Customers
-api.get('/admin/customers', staffOnly, asyncRoute(async (req, res) => {
+api.get('/admin/customers', can('customers.view'), asyncRoute(async (req, res) => {
   const q = typeof req.query.q === 'string' ? clean(req.query.q).slice(0, 60) : '';
   const filter: Record<string, unknown> = { role: { $in: ['customer'] } };
   if (q) {
@@ -2022,7 +2185,7 @@ api.get('/admin/customers', staffOnly, asyncRoute(async (req, res) => {
   });
 }));
 
-api.patch('/admin/customers/:id', writeLimiter, adminOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/customers/:id', writeLimiter, can('customers.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid customer id.', 'bad_request');
   const body = z.object({ isActive: z.boolean().optional(), role: z.enum(['customer', 'manager', 'admin']).optional() }).parse(req.body);
   if (String(req.params.id) === String(req.user!._id) && body.role && body.role !== 'admin') {
@@ -2037,11 +2200,11 @@ api.patch('/admin/customers/:id', writeLimiter, adminOnly, asyncRoute(async (req
 }));
 
 // Coupons
-api.get('/admin/coupons', staffOnly, asyncRoute(async (_req, res) => {
+api.get('/admin/coupons', can('coupons.manage'), asyncRoute(async (_req, res) => {
   res.json({ coupons: await Coupon.find().sort({ createdAt: -1 }).lean() });
 }));
 
-api.post('/admin/coupons', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.post('/admin/coupons', writeLimiter, can('coupons.manage'), asyncRoute(async (req, res) => {
   const body = couponInput.parse(req.body);
   const exists = await Coupon.exists({ code: body.code.toUpperCase() });
   if (exists) throw new ApiError(409, 'That coupon code already exists.', 'duplicate');
@@ -2056,7 +2219,7 @@ api.post('/admin/coupons', writeLimiter, staffOnly, asyncRoute(async (req, res) 
   res.status(201).json({ coupon });
 }));
 
-api.patch('/admin/coupons/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/coupons/:id', writeLimiter, can('coupons.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid coupon id.', 'bad_request');
   const body = couponInput.partial().parse(req.body);
   const update: Record<string, unknown> = { ...body };
@@ -2069,7 +2232,7 @@ api.patch('/admin/coupons/:id', writeLimiter, staffOnly, asyncRoute(async (req, 
   res.json({ coupon });
 }));
 
-api.delete('/admin/coupons/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.delete('/admin/coupons/:id', writeLimiter, can('coupons.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid coupon id.', 'bad_request');
   await Coupon.deleteOne({ _id: req.params.id });
   await audit(req, 'coupon.deleted', 'coupon', String(req.params.id));
@@ -2077,7 +2240,7 @@ api.delete('/admin/coupons/:id', writeLimiter, staffOnly, asyncRoute(async (req,
 }));
 
 // Reviews
-api.get('/admin/reviews', staffOnly, asyncRoute(async (req, res) => {
+api.get('/admin/reviews', can('reviews.manage'), asyncRoute(async (req, res) => {
   const filter: Record<string, unknown> = {};
   if (typeof req.query.status === 'string' && ['pending', 'approved', 'rejected'].includes(req.query.status)) {
     filter.status = req.query.status;
@@ -2086,7 +2249,7 @@ api.get('/admin/reviews', staffOnly, asyncRoute(async (req, res) => {
   res.json({ reviews });
 }));
 
-api.patch('/admin/reviews/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/reviews/:id', writeLimiter, can('reviews.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid review id.', 'bad_request');
   const body = z.object({ status: z.enum(['pending', 'approved', 'rejected']) }).parse(req.body);
   const review = await Review.findByIdAndUpdate(req.params.id, { $set: { status: body.status } }, { new: true });
@@ -2103,7 +2266,7 @@ api.patch('/admin/reviews/:id', writeLimiter, staffOnly, asyncRoute(async (req, 
   res.json({ review });
 }));
 
-api.delete('/admin/reviews/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.delete('/admin/reviews/:id', writeLimiter, can('reviews.manage'), asyncRoute(async (req, res) => {
   if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid review id.', 'bad_request');
   await Review.deleteOne({ _id: req.params.id });
   await audit(req, 'review.deleted', 'review', String(req.params.id));
@@ -2111,11 +2274,11 @@ api.delete('/admin/reviews/:id', writeLimiter, staffOnly, asyncRoute(async (req,
 }));
 
 // Messages
-api.get('/admin/messages', staffOnly, asyncRoute(async (_req, res) => {
+api.get('/admin/messages', can('messages.manage'), asyncRoute(async (_req, res) => {
   res.json({ messages: await Message.find().sort({ createdAt: -1 }).limit(100).lean() });
 }));
 
-api.patch('/admin/messages/:id', writeLimiter, staffOnly, asyncRoute(async (req, res) => {
+api.patch('/admin/messages/:id', writeLimiter, can('messages.manage'), asyncRoute(async (req, res) => {
   const body = z.object({ isRead: z.boolean() }).parse(req.body);
   const message = await Message.findByIdAndUpdate(req.params.id, { $set: body }, { new: true });
   if (!message) throw new ApiError(404, 'Message not found.', 'not_found');
@@ -2123,7 +2286,7 @@ api.patch('/admin/messages/:id', writeLimiter, staffOnly, asyncRoute(async (req,
 }));
 
 // Settings
-api.get('/admin/settings', staffOnly, asyncRoute(async (_req, res) => {
+api.get('/admin/settings', can('settings.view'), asyncRoute(async (_req, res) => {
   const settings = await getSettings();
   const cover = await Asset.findOne({ key: 'support-cover' }).select('updatedAt').lean();
   res.json({
@@ -2134,7 +2297,7 @@ api.get('/admin/settings', staffOnly, asyncRoute(async (_req, res) => {
   });
 }));
 
-api.put('/admin/settings', writeLimiter, adminOnly, asyncRoute(async (req, res) => {
+api.put('/admin/settings', writeLimiter, can('settings.manage'), asyncRoute(async (req, res) => {
   const body = z
     .object({
       storeName: z.string().trim().min(2).max(80).optional(),
@@ -2185,7 +2348,7 @@ function assertPublicHttpUrl(raw: string): URL {
 api.post(
   '/admin/support-cover',
   writeLimiter,
-  adminOnly,
+  can('settings.manage'),
   express.raw({ type: IMAGE_TYPES, limit: '4mb' }),
   asyncRoute(async (req, res) => {
     const buffer = Buffer.isBuffer(req.body) ? req.body : null;
@@ -2206,7 +2369,7 @@ api.post(
 api.post(
   '/admin/images',
   writeLimiter,
-  staffOnly,
+  can('images.upload'),
   express.raw({ type: IMAGE_TYPES, limit: '4mb' }),
   asyncRoute(async (req, res) => {
     const buffer = Buffer.isBuffer(req.body) ? req.body : null;
@@ -2221,7 +2384,7 @@ api.post(
   })
 );
 
-api.post('/admin/support-cover/url', writeLimiter, adminOnly, asyncRoute(async (req, res) => {
+api.post('/admin/support-cover/url', writeLimiter, can('settings.manage'), asyncRoute(async (req, res) => {
   const { url } = z.object({ url: z.string().trim().min(8).max(1000) }).parse(req.body);
   const target = assertPublicHttpUrl(url);
   let upstream: Awaited<ReturnType<typeof fetch>>;
@@ -2245,17 +2408,581 @@ api.post('/admin/support-cover/url', writeLimiter, adminOnly, asyncRoute(async (
   res.json({ url: `/api/support-cover?v=${Date.now()}` });
 }));
 
-api.delete('/admin/support-cover', writeLimiter, adminOnly, asyncRoute(async (req, res) => {
+api.delete('/admin/support-cover', writeLimiter, can('settings.manage'), asyncRoute(async (req, res) => {
   await Asset.deleteOne({ key: 'support-cover' });
   await audit(req, 'support.cover_removed', 'settings', 'support-cover', {});
   res.json({ ok: true });
 }));
 
-// Audit trail
-api.get('/admin/audit', adminOnly, asyncRoute(async (_req, res) => {
-  const logs = await Audit.find().sort({ at: -1 }).limit(200).lean();
-  res.json({ logs });
+/* ==========================================================================
+ * 14b. ROUTES — ROLE-BASED ADMIN MANAGEMENT
+ * --------------------------------------------------------------------------
+ * The main (super) admin owns the system: only they hold every permission by
+ * default, and nobody — including them — can strip the main admin account.
+ * Delegated managers with `admins.manage` can only hand out permissions they
+ * already hold themselves, so access can never be escalated sideways.
+ * ========================================================================== */
+
+const zPermissionList = z.array(z.enum(ALL_PERMISSIONS as [string, ...string[]])).max(60);
+
+async function revokeSessions(userId: unknown) {
+  await RefreshToken.updateMany({ user: userId, revokedAt: null }, { $set: { revokedAt: new Date() } });
+  await User.updateOne({ _id: userId }, { $inc: { tokenVersion: 1 } });
+}
+
+/** Super-admin accounts are untouchable for everyone but themselves. */
+function assertManageable(req: Request, target: any) {
+  if (!target) throw new ApiError(404, 'Admin account not found.', 'not_found');
+  if (target.isSuperAdmin && !req.user!.isSuperAdmin) {
+    throw new ApiError(403, 'Only the main admin can change the main admin account.', 'forbidden');
+  }
+  if (String(target._id) === String(req.user!._id)) {
+    throw new ApiError(400, 'Use the main admin panel or your own password page to change your account.', 'self_edit');
+  }
+  if (target.isSuperAdmin) {
+    throw new ApiError(400, 'The main admin account cannot be suspended, edited or deleted here.', 'super_admin');
+  }
+}
+
+function assertCanGrant(req: Request, next: string[]) {
+  if (req.user!.isSuperAdmin) return;
+  const held = effectivePermissions(req.user!);
+  const extra = next.find((p) => !held.includes(p));
+  if (extra) {
+    throw new ApiError(403, `You cannot grant the "${extra}" permission because you do not have it.`, 'forbidden');
+  }
+}
+
+function staffPublic(user: any) {
+  const role = user.adminRole && typeof user.adminRole === 'object' && 'name' in user.adminRole ? user.adminRole : null;
+  return {
+    id: String(user._id),
+    name: user.name,
+    email: user.email,
+    phone: user.phone ?? '',
+    role: user.role,
+    isActive: user.isActive !== false,
+    isSuperAdmin: Boolean(user.isSuperAdmin),
+    permissions: effectivePermissions(user),
+    adminRole: role ? { id: String(role._id ?? ''), name: role.name } : null,
+    suspendedReason: user.suspendedReason ?? '',
+    suspendedAt: user.suspendedAt ?? null,
+    lastLoginAt: user.lastLoginAt ?? null,
+    createdAt: user.createdAt ?? null,
+  };
+}
+
+function publicRole(role: any) {
+  return {
+    id: String(role._id),
+    name: role.name,
+    description: role.description ?? '',
+    permissions: (role.permissions ?? []).filter((p: string) => ALL_PERMISSIONS.includes(p)),
+    isSystem: Boolean(role.isSystem),
+  };
+}
+
+const STAFF_FIELDS =
+  'name email phone role isActive isSuperAdmin permissions adminRole suspendedReason suspendedAt lastLoginAt createdAt';
+
+api.get('/admin/permissions', can('admins.view'), (_req, res) => {
+  res.json({ permissions: PERMISSIONS, all: ALL_PERMISSIONS });
+});
+
+api.get('/admin/admins', can('admins.view'), asyncRoute(async (_req, res) => {
+  const admins = await User.find({ role: { $in: ['admin', 'manager'] } })
+    .select(STAFF_FIELDS)
+    .populate('adminRole', 'name')
+    .sort({ isSuperAdmin: -1, createdAt: 1 })
+    .lean();
+  res.json({ admins: admins.map(staffPublic) });
 }));
+
+api.post(
+  '/admin/admins',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    const body = z
+      .object({
+        name: zName,
+        email: zEmail,
+        phone: z.string().trim().max(20).optional().default(''),
+        password: z.string().min(10).max(200),
+        roleId: zId.nullish(),
+        permissions: zPermissionList.optional(),
+      })
+      .parse(req.body);
+    assertStrongPassword(body.password);
+
+    let perms = body.permissions ? [...new Set(body.permissions)] : [];
+    let roleDoc: any = null;
+    if (body.roleId) {
+      roleDoc = await AdminRole.findById(body.roleId).lean();
+      if (!roleDoc) throw new ApiError(404, 'That role does not exist.', 'not_found');
+      if (!body.permissions) perms = [...(roleDoc.permissions ?? [])];
+    }
+    assertCanGrant(req, perms);
+    if (await User.exists({ email: body.email })) {
+      throw new ApiError(409, 'An account with this email already exists.', 'email_taken');
+    }
+
+    const user = await User.create({
+      name: body.name,
+      email: body.email,
+      phone: body.phone,
+      passwordHash: await bcrypt.hash(body.password, BCRYPT_COST),
+      role: 'admin',
+      permissions: perms,
+      adminRole: roleDoc?._id ?? null,
+      createdBy: req.user!._id,
+    });
+    await audit(req, 'admin.created', 'user', String(user._id), { email: user.email, permissions: perms });
+    const created = await User.findById(user._id).select(STAFF_FIELDS).populate('adminRole', 'name').lean();
+    res.status(201).json({ admin: staffPublic(created) });
+  })
+);
+
+api.patch(
+  '/admin/admins/:id',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid admin id.', 'bad_request');
+    const target = await User.findById(req.params.id).select(STAFF_FIELDS).lean();
+    assertManageable(req, target);
+
+    const body = z
+      .object({
+        name: zName.optional(),
+        email: zEmail.optional(),
+        phone: z.string().trim().max(20).optional(),
+        roleId: zId.nullish(),
+        permissions: zPermissionList.optional(),
+        isActive: z.boolean().optional(),
+      })
+      .parse(req.body);
+
+    if (body.permissions) assertCanGrant(req, body.permissions);
+    const update: Record<string, unknown> = {};
+    if (body.name) update.name = body.name;
+    if (body.email) {
+      if (await User.exists({ email: body.email, _id: { $ne: (target as any)._id } })) {
+        throw new ApiError(409, 'An account with this email already exists.', 'email_taken');
+      }
+      update.email = body.email;
+    }
+    if (body.phone !== undefined) update.phone = body.phone;
+    if (body.permissions) update.permissions = [...new Set(body.permissions)];
+    if (body.roleId !== undefined) {
+      if (body.roleId) {
+        const role = await AdminRole.findById(body.roleId).lean();
+        if (!role) throw new ApiError(404, 'That role does not exist.', 'not_found');
+        update.adminRole = (role as any)._id;
+        if (!body.permissions) {
+          const rolePerms = (role as any).permissions ?? [];
+          assertCanGrant(req, rolePerms);
+          update.permissions = [...rolePerms];
+        }
+      } else {
+        update.adminRole = null;
+      }
+    }
+    if (body.isActive !== undefined) {
+      update.isActive = body.isActive;
+      update.suspendedAt = body.isActive ? null : new Date();
+      if (body.isActive) update.suspendedReason = '';
+    }
+    if (!Object.keys(update).length) throw new ApiError(400, 'Nothing to update.', 'empty');
+
+    await User.updateOne({ _id: (target as any)._id }, { $set: update });
+    // Access changes (or a suspension) end every existing session immediately.
+    if (body.permissions || body.roleId !== undefined || body.isActive === false) {
+      await revokeSessions((target as any)._id);
+    }
+    await audit(req, 'admin.updated', 'user', String(req.params.id), {
+      fields: Object.keys(update),
+      permissions: update.permissions ? (update.permissions as string[]).length : undefined,
+    });
+    const updated = await User.findById(req.params.id).select(STAFF_FIELDS).populate('adminRole', 'name').lean();
+    res.json({ admin: staffPublic(updated) });
+  })
+);
+
+api.post(
+  '/admin/admins/:id/suspend',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid admin id.', 'bad_request');
+    const target = await User.findById(req.params.id).select(STAFF_FIELDS).lean();
+    assertManageable(req, target);
+    const { reason } = z.object({ reason: z.string().trim().max(200).optional().default('') }).parse(req.body ?? {});
+    await User.updateOne(
+      { _id: req.params.id },
+      { $set: { isActive: false, suspendedAt: new Date(), suspendedReason: reason } }
+    );
+    await revokeSessions(req.params.id);
+    await audit(req, 'admin.suspended', 'user', String(req.params.id), { reason });
+    res.json({ ok: true });
+  })
+);
+
+api.post(
+  '/admin/admins/:id/activate',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid admin id.', 'bad_request');
+    const target = await User.findById(req.params.id).select(STAFF_FIELDS).lean();
+    assertManageable(req, target);
+    await User.updateOne({ _id: req.params.id }, { $set: { isActive: true, suspendedAt: null, suspendedReason: '' } });
+    await audit(req, 'admin.activated', 'user', String(req.params.id));
+    res.json({ ok: true });
+  })
+);
+
+api.post(
+  '/admin/admins/:id/password',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid admin id.', 'bad_request');
+    const target = await User.findById(req.params.id).select(STAFF_FIELDS).lean();
+    assertManageable(req, target);
+    const { password } = z.object({ password: z.string().min(10).max(200) }).parse(req.body);
+    assertStrongPassword(password);
+    await User.updateOne(
+      { _id: req.params.id },
+      { $set: { passwordHash: await bcrypt.hash(password, BCRYPT_COST), passwordChangedAt: new Date() } }
+    );
+    await revokeSessions(req.params.id);
+    await audit(req, 'admin.password_reset', 'user', String(req.params.id));
+    res.json({ ok: true });
+  })
+);
+
+api.delete(
+  '/admin/admins/:id',
+  writeLimiter,
+  can('admins.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid admin id.', 'bad_request');
+    const target = await User.findById(req.params.id).select(STAFF_FIELDS).lean();
+    assertManageable(req, target);
+    await revokeSessions(req.params.id);
+    await User.deleteOne({ _id: req.params.id });
+    await audit(req, 'admin.deleted', 'user', String(req.params.id), { email: (target as any)?.email ?? '' });
+    res.json({ ok: true });
+  })
+);
+
+/* Role templates -------------------------------------------------------- */
+
+api.get('/admin/roles', can('admins.view'), asyncRoute(async (_req, res) => {
+  const roles = await AdminRole.find().sort({ isSystem: -1, name: 1 }).lean();
+  res.json({ roles: roles.map(publicRole) });
+}));
+
+api.post(
+  '/admin/roles',
+  writeLimiter,
+  can('roles.manage'),
+  asyncRoute(async (req, res) => {
+    const body = z
+      .object({
+        name: z.string().trim().min(2).max(60),
+        description: z.string().trim().max(200).optional().default(''),
+        permissions: zPermissionList.default([]),
+      })
+      .parse(req.body);
+    assertCanGrant(req, body.permissions);
+    if (await AdminRole.exists({ name: body.name })) {
+      throw new ApiError(409, 'A role with that name already exists.', 'duplicate');
+    }
+    const role = await AdminRole.create({
+      name: body.name,
+      description: body.description,
+      permissions: [...new Set(body.permissions)],
+      createdBy: req.user!._id,
+    });
+    await audit(req, 'role.created', 'role', String(role._id), { name: role.name });
+    res.status(201).json({ role: publicRole(role.toObject()) });
+  })
+);
+
+api.patch(
+  '/admin/roles/:id',
+  writeLimiter,
+  can('roles.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid role id.', 'bad_request');
+    const existing = await AdminRole.findById(req.params.id).lean();
+    if (!existing) throw new ApiError(404, 'Role not found.', 'not_found');
+    const body = z
+      .object({
+        name: z.string().trim().min(2).max(60).optional(),
+        description: z.string().trim().max(200).optional(),
+        permissions: zPermissionList.optional(),
+      })
+      .parse(req.body);
+    if (body.permissions) assertCanGrant(req, body.permissions);
+    const update: Record<string, unknown> = {};
+    if (body.name) update.name = body.name;
+    if (body.description !== undefined) update.description = body.description;
+    if (body.permissions) update.permissions = [...new Set(body.permissions)];
+    if (!Object.keys(update).length) throw new ApiError(400, 'Nothing to update.', 'empty');
+    const role = await AdminRole.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
+    await audit(req, 'role.updated', 'role', String(req.params.id), { fields: Object.keys(update) });
+    res.json({ role: publicRole(role?.toObject() ?? (existing as any)) });
+  })
+);
+
+api.delete(
+  '/admin/roles/:id',
+  writeLimiter,
+  can('roles.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid role id.', 'bad_request');
+    const role = await AdminRole.findById(req.params.id).lean();
+    if (!role) throw new ApiError(404, 'Role not found.', 'not_found');
+    if ((role as any).isSystem) {
+      throw new ApiError(400, 'Built-in roles cannot be deleted. Edit their permissions instead.', 'system_role');
+    }
+    await AdminRole.deleteOne({ _id: req.params.id });
+    await User.updateMany({ adminRole: (role as any)._id }, { $set: { adminRole: null } });
+    await audit(req, 'role.deleted', 'role', String(req.params.id), { name: (role as any).name });
+    res.json({ ok: true });
+  })
+);
+
+/* Investors ----------------------------------------------------------------
+ * Each investor keeps a ledger of what they put in, so a record can be added
+ * later without overwriting the earlier ones. Totals are computed here; the
+ * client never sends a total.
+ * ========================================================================== */
+
+function publicInvestor(inv: any) {
+  const entries = (inv.investments ?? [])
+    .map((e: any) => ({
+      id: String(e._id),
+      amount: Number(e.amount) || 0,
+      method: e.method ?? '',
+      note: e.note ?? '',
+      investedAt: e.investedAt ?? null,
+    }))
+    .sort((a: any, b: any) => new Date(b.investedAt ?? 0).getTime() - new Date(a.investedAt ?? 0).getTime());
+  const totalInvested = entries.reduce((sum: number, e: any) => sum + e.amount, 0);
+  return {
+    id: String(inv._id),
+    name: inv.name,
+    phone: inv.phone ?? '',
+    email: inv.email ?? '',
+    company: inv.company ?? '',
+    note: inv.note ?? '',
+    isActive: inv.isActive !== false,
+    totalInvested,
+    investmentCount: entries.length,
+    lastInvestedAt: entries[0]?.investedAt ?? null,
+    investments: entries,
+    createdAt: inv.createdAt ?? null,
+  };
+}
+
+const zInvestorEmail = z.union([z.string().trim().toLowerCase().email().max(160), z.literal('')]);
+const zInvestmentAmount = z.number().int().min(1, 'Enter an amount greater than zero.').max(1_000_000_000_000);
+
+function parseInvestedAt(value?: string): Date {
+  if (!value) return new Date();
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime())) {
+    throw new ApiError(400, 'Enter a valid investment date.', 'bad_request');
+  }
+  return when;
+}
+
+api.get(
+  '/admin/investors',
+  can('investors.view'),
+  asyncRoute(async (req, res) => {
+    const q = typeof req.query.q === 'string' ? clean(req.query.q).slice(0, 60) : '';
+    const filter: Record<string, unknown> = {};
+    if (q) {
+      const rx = { $regex: escapeRegex(q), $options: 'i' };
+      filter.$or = [{ name: rx }, { phone: rx }, { email: rx }, { company: rx }];
+    }
+    const docs = await Investor.find(filter).sort({ createdAt: -1 }).limit(500).lean();
+    const investors = docs.map(publicInvestor).sort((a: any, b: any) => b.totalInvested - a.totalInvested);
+    const lastInvestedAt = investors.reduce((latest: Date | null, inv: any) => {
+      if (!inv.lastInvestedAt) return latest;
+      const when = new Date(inv.lastInvestedAt);
+      return !latest || when > latest ? when : latest;
+    }, null);
+    res.json({
+      investors,
+      summary: {
+        totalInvested: investors.reduce((sum: number, inv: any) => sum + inv.totalInvested, 0),
+        investorCount: investors.length,
+        activeCount: investors.filter((inv: any) => inv.isActive).length,
+        lastInvestedAt,
+      },
+    });
+  })
+);
+
+api.post(
+  '/admin/investors',
+  writeLimiter,
+  can('investors.manage'),
+  asyncRoute(async (req, res) => {
+    const body = z
+      .object({
+        name: z.string().trim().min(2).max(120),
+        phone: z.string().trim().max(30).optional().default(''),
+        email: zInvestorEmail.optional().default(''),
+        company: z.string().trim().max(120).optional().default(''),
+        note: z.string().trim().max(400).optional().default(''),
+        isActive: z.boolean().optional(),
+        // Optional first investment, so adding an investor takes one step.
+        amount: zInvestmentAmount.optional(),
+        method: z.string().trim().max(40).optional().default(''),
+        investedAt: z.string().trim().optional(),
+      })
+      .parse(req.body);
+
+    const investments = body.amount
+      ? [{ amount: body.amount, method: body.method, note: body.note, investedAt: parseInvestedAt(body.investedAt) }]
+      : [];
+    const investor = await Investor.create({
+      name: body.name,
+      phone: body.phone,
+      email: body.email,
+      company: body.company,
+      note: body.note,
+      isActive: body.isActive ?? true,
+      investments,
+      createdBy: req.user!._id,
+    });
+    await audit(req, 'investor.created', 'investor', String(investor._id), {
+      name: investor.name,
+      amount: body.amount ?? 0,
+    });
+    res.status(201).json({ investor: publicInvestor(investor.toObject()) });
+  })
+);
+
+api.patch(
+  '/admin/investors/:id',
+  writeLimiter,
+  can('investors.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid investor id.', 'bad_request');
+    const body = z
+      .object({
+        name: z.string().trim().min(2).max(120).optional(),
+        phone: z.string().trim().max(30).optional(),
+        email: zInvestorEmail.optional(),
+        company: z.string().trim().max(120).optional(),
+        note: z.string().trim().max(400).optional(),
+        isActive: z.boolean().optional(),
+      })
+      .parse(req.body);
+    const update: Record<string, unknown> = {};
+    (['name', 'phone', 'email', 'company', 'note', 'isActive'] as const).forEach((key) => {
+      if (body[key] !== undefined) update[key] = body[key];
+    });
+    if (!Object.keys(update).length) throw new ApiError(400, 'Nothing to update.', 'empty');
+
+    const investor = await Investor.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).lean();
+    if (!investor) throw new ApiError(404, 'Investor not found.', 'not_found');
+    await audit(req, 'investor.updated', 'investor', String(req.params.id), { fields: Object.keys(update) });
+    res.json({ investor: publicInvestor(investor) });
+  })
+);
+
+api.delete(
+  '/admin/investors/:id',
+  writeLimiter,
+  can('investors.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid investor id.', 'bad_request');
+    const investor = await Investor.findByIdAndDelete(req.params.id).lean();
+    if (!investor) throw new ApiError(404, 'Investor not found.', 'not_found');
+    await audit(req, 'investor.deleted', 'investor', String(req.params.id), { name: (investor as any).name });
+    res.json({ ok: true });
+  })
+);
+
+api.post(
+  '/admin/investors/:id/investments',
+  writeLimiter,
+  can('investors.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid investor id.', 'bad_request');
+    const body = z
+      .object({
+        amount: zInvestmentAmount,
+        method: z.string().trim().max(40).optional().default(''),
+        note: z.string().trim().max(240).optional().default(''),
+        investedAt: z.string().trim().optional(),
+      })
+      .parse(req.body);
+
+    const investor = await Investor.findById(req.params.id);
+    if (!investor) throw new ApiError(404, 'Investor not found.', 'not_found');
+    investor.investments.push({
+      amount: body.amount,
+      method: body.method,
+      note: body.note,
+      investedAt: parseInvestedAt(body.investedAt),
+    });
+    await investor.save();
+    await audit(req, 'investment.added', 'investor', String(investor._id), {
+      name: investor.name,
+      amount: body.amount,
+    });
+    res.status(201).json({ investor: publicInvestor(investor.toObject()) });
+  })
+);
+
+api.delete(
+  '/admin/investors/:id/investments/:entryId',
+  writeLimiter,
+  can('investors.manage'),
+  asyncRoute(async (req, res) => {
+    if (!isObjId(req.params.id)) throw new ApiError(400, 'Invalid investor id.', 'bad_request');
+    const investor = await Investor.findById(req.params.id);
+    if (!investor) throw new ApiError(404, 'Investor not found.', 'not_found');
+    const entry = investor.investments.id(req.params.entryId);
+    if (!entry) throw new ApiError(404, 'Investment not found.', 'not_found');
+    const amount = entry.amount;
+    entry.deleteOne();
+    await investor.save();
+    await audit(req, 'investment.removed', 'investor', String(investor._id), {
+      name: investor.name,
+      amount,
+    });
+    res.json({ investor: publicInvestor(investor.toObject()) });
+  })
+);
+
+// Audit trail
+api.get(
+  '/admin/audit',
+  can('audit.view'),
+  asyncRoute(async (req, res) => {
+    const q = typeof req.query.q === 'string' ? clean(req.query.q).slice(0, 60) : '';
+    const action = typeof req.query.action === 'string' ? clean(req.query.action).slice(0, 60) : '';
+    const filter: Record<string, unknown> = {};
+    if (q) {
+      const rx = { $regex: escapeRegex(q), $options: 'i' };
+      filter.$or = [{ actorEmail: rx }, { action: rx }, { targetType: rx }, { targetId: rx }];
+    }
+    if (action) filter.action = { $regex: `^${escapeRegex(action)}` };
+    const logs = await Audit.find(filter).sort({ at: -1 }).limit(300).lean();
+    res.json({ logs });
+  })
+);
 
 app.use('/api', api);
 
@@ -2278,12 +3005,19 @@ if (fs.existsSync(ADMIN_INDEX)) {
       maxAge: '1h',
       setHeaders(res, filePath) {
         if (filePath.endsWith('index.html')) res.setHeader('Cache-Control', 'no-store');
+        // The dashboard is staff-only: never framed by another site, never indexed.
+        res.setHeader('X-Frame-Options', 'DENY');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        res.setHeader('Referrer-Policy', 'no-referrer');
       },
     })
   );
   // SPA fallback for dashboard deep links.
   app.get(['/admin', '/admin/*'], (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+    res.setHeader('Referrer-Policy', 'no-referrer');
     res.sendFile(ADMIN_INDEX);
   });
 } else {
@@ -2339,10 +3073,55 @@ app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
 
 const IMG = (seed: string) => `/api/img/${seed}`;
 
+/**
+ * Demo photography shipped with the storefront (served from frontend/public).
+ * Real admin uploads are absolute URLs and are never touched by this mapping.
+ */
+const DEMO_IMAGES: Record<string, string[]> = {
+  'kurti-set': ['/demo/kurti-1.jpg', '/demo/kurti-2.jpg', '/demo/kurti-3.jpg'],
+  'farsi-set': ['/demo/farsi-1.jpg', '/demo/farsi-2.jpg'],
+  corset: ['/demo/corset-1.jpg', '/demo/corset-2.jpg'],
+};
+
+function demoImages(cat: string, index: number, name: string): { url: string; alt: string }[] {
+  const pool = DEMO_IMAGES[cat] ?? [];
+  if (pool.length === 0) return [{ url: IMG(name.toLowerCase().replace(/[^a-z0-9]+/g, '-')), alt: name }];
+  const first = pool[index % pool.length]!;
+  const second = pool[(index + 1) % pool.length]!;
+  return second === first
+    ? [{ url: first, alt: name }]
+    : [
+        { url: first, alt: name },
+        { url: second, alt: name },
+      ];
+}
+
+/** Swaps the generated placeholder artwork on seeded products for the demo photos. */
+async function applyDemoImages() {
+  const cats = await Category.find().lean();
+  const slugById = new Map<string, string>(cats.map((c: any) => [String(c._id), String(c.slug)]));
+
+  for (const category of cats as any[]) {
+    const pool = DEMO_IMAGES[String(category.slug)];
+    if (pool?.length && String(category.image ?? '').startsWith('/api/img/')) {
+      await Category.updateOne({ _id: category._id }, { $set: { image: pool[0] } });
+    }
+  }
+
+  const products = await Product.find({ 'images.0.url': /^\/api\/img\// }).sort({ createdAt: 1 }).lean();
+  let changed = 0;
+  for (const [index, product] of (products as any[]).entries()) {
+    const images = demoImages(slugById.get(String(product.category)) ?? '', index, String(product.name));
+    await Product.updateOne({ _id: product._id }, { $set: { images } });
+    changed += 1;
+  }
+  if (changed) console.log(`[seed] demo photos applied to ${changed} products`);
+}
+
 const SEED_CATEGORIES = [
-  { name: 'Kurti Set', slug: 'kurti-set', description: 'Two and three piece kurti sets.', sortOrder: 1, image: IMG('cat-kurti-set') },
-  { name: 'Farsi Set', slug: 'farsi-set', description: 'Elegant farsi sets for every occasion.', sortOrder: 2, image: IMG('cat-farsi-set') },
-  { name: 'Corset', slug: 'corset', description: 'Structured corsets to complete the look.', sortOrder: 3, image: IMG('cat-corset') },
+  { name: 'Kurti Set', slug: 'kurti-set', description: 'Two and three piece kurti sets.', sortOrder: 1, image: '/demo/kurti-1.jpg' },
+  { name: 'Farsi Set', slug: 'farsi-set', description: 'Elegant farsi sets for every occasion.', sortOrder: 2, image: '/demo/farsi-1.jpg' },
+  { name: 'Corset', slug: 'corset', description: 'Structured corsets to complete the look.', sortOrder: 3, image: '/demo/corset-1.jpg' },
 ];
 
 const SEED_PRODUCTS = [
@@ -2405,7 +3184,7 @@ async function seed(force = false) {
       description:
         'Premium fabric, carefully finished and ready for everyday wear. Every piece is quality checked before dispatch, with nationwide delivery in 3-5 days and easy 7 day returns.',
       category: catMap.get(p.cat),
-      images: [{ url: IMG(p.colors), alt: p.name }, { url: IMG(`${p.colors}-b`), alt: p.name }],
+      images: demoImages(p.cat, index, p.name),
       variants: p.high
         ? [
             { label: p.cat === 'corset' ? 'Regular' : 'Kurti Only', price: p.base, compareAtPrice: Math.round((p.base * 1.3) / 100) * 100, stock: index % 7 === 5 ? 0 : 12 },
@@ -2418,6 +3197,104 @@ async function seed(force = false) {
     await Product.insertMany(docs);
     console.log(`[seed] ${docs.length} products created`);
   }
+
+  await applyDemoImages();
+
+  // The public welcome offer. Creating it on boot keeps fresh and existing
+  // databases aligned without overwriting an admin's edited coupon.
+  if (!(await Coupon.findOne({ code: 'NIVORA10' }).lean())) {
+    await Coupon.create({
+      code: 'NIVORA10',
+      type: 'percent',
+      value: 10,
+      minSubtotal: 0,
+      maxDiscount: 0,
+      usageLimit: 0,
+      perUserLimit: 5,
+      isActive: true,
+    });
+    console.log('[seed] coupon NIVORA10 created (10% off products)');
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * RBAC bootstrap — runs once per server process, after the DB is connected.
+ * Guarantees exactly one Main Admin (the ADMIN_EMAIL account) exists and that
+ * a fresh database starts with a few usable role templates.
+ * ========================================================================== */
+
+const DEFAULT_ROLES = [
+  {
+    name: 'Operations Manager',
+    description: 'Runs day-to-day orders, stock and customer support.',
+    permissions: [
+      'dashboard.view',
+      'orders.view',
+      'orders.manage',
+      'orders.payment',
+      'products.view',
+      'products.manage',
+      'images.upload',
+      'customers.view',
+      'messages.manage',
+    ],
+  },
+  {
+    name: 'Catalogue Manager',
+    description: 'Owns products, categories and pictures.',
+    permissions: ['dashboard.view', 'products.view', 'products.manage', 'categories.manage', 'images.upload'],
+  },
+  {
+    name: 'Support Agent',
+    description: 'Answers customers and keeps reviews tidy.',
+    permissions: ['dashboard.view', 'orders.view', 'customers.view', 'messages.manage', 'reviews.manage'],
+  },
+  {
+    name: 'Store Auditor',
+    description: 'Read-only access to orders, catalogue and the activity log.',
+    permissions: ['dashboard.view', 'orders.view', 'products.view', 'customers.view', 'audit.view'],
+  },
+];
+
+let rbacPromise: Promise<void> | null = null;
+
+async function ensureRbac(): Promise<void> {
+  if (!rbacPromise) {
+    rbacPromise = (async () => {
+      try {
+        if ((await AdminRole.countDocuments()) === 0) {
+          await AdminRole.insertMany(DEFAULT_ROLES.map((r) => ({ ...r, isSystem: true })));
+          console.log('[rbac] default roles created');
+        }
+        if ((await User.countDocuments({ isSuperAdmin: true })) > 0) return;
+
+        const adminEmail = (process.env.ADMIN_EMAIL ?? 'admin@nivora.local').toLowerCase();
+        const existing = await User.findOne({ email: adminEmail });
+        if (existing) {
+          await User.updateOne(
+            { _id: existing._id },
+            { $set: { isSuperAdmin: true, role: 'admin', isActive: true }, $unset: { permissions: 1 } }
+          );
+        } else {
+          const password = process.env.ADMIN_PASSWORD ?? 'Admin@12345678';
+          await User.create({
+            name: 'Store Admin',
+            email: adminEmail,
+            phone: '01700000000',
+            passwordHash: await bcrypt.hash(password, BCRYPT_COST),
+            role: 'admin',
+            isSuperAdmin: true,
+          });
+          console.log('[rbac] main admin created:', adminEmail);
+        }
+        console.log('[rbac] main admin ready:', adminEmail);
+      } catch (err) {
+        rbacPromise = null; // retry on the next request
+        console.error('[rbac] bootstrap failed', err);
+      }
+    })();
+  }
+  return rbacPromise;
 }
 
 export async function connectDatabase() {
@@ -2439,6 +3316,7 @@ export async function connectDatabase() {
     maxPoolSize: 20,
   });
   console.log('[db] connected');
+  await ensureRbac();
 }
 
 /** Connect once per serverless instance and reuse the pool across invocations. */

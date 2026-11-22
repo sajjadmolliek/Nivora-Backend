@@ -132,6 +132,9 @@ interface User {
   phone: string;
   role: 'customer' | 'manager' | 'admin';
   addresses: Address[];
+  /** Main admin: every permission, and the only account that can grant them. */
+  isSuperAdmin?: boolean;
+  permissions?: string[];
 }
 
 interface QuoteLine {
@@ -532,6 +535,21 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>;
 }
 
+/**
+ * Permission helper. `isSuperAdmin` (the main admin) implicitly holds every
+ * permission; everyone else is limited to the list the API returned.
+ */
+function usePermissions() {
+  const { user } = useAuth();
+  return useMemo(
+    () => ({
+      isSuperAdmin: Boolean(user?.isSuperAdmin),
+      has: (perm: string) => Boolean(user?.isSuperAdmin || (user?.permissions ?? []).includes(perm)),
+    }),
+    [user]
+  );
+}
+
 /* =============================================================================
  * 5. UI PRIMITIVES
  * ========================================================================== */
@@ -804,27 +822,117 @@ function Protected({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/** Route-level permission gate; the API enforces the same rule server-side. */
+function Permission({ perm, children }: { perm: string; children: React.ReactNode }) {
+  const { has } = usePermissions();
+  if (!has(perm)) {
+    return (
+      <Empty
+        title="No access to this page"
+        text={`Your account does not have the "${perm}" permission. Ask the main admin to grant it.`}
+        action={
+          <Link className="btn btn-primary" to="/admin">
+            Back to overview
+          </Link>
+        }
+      />
+    );
+  }
+  return <>{children}</>;
+}
+
 /* =============================================================================
  * 18. DASHBOARD — LAYOUT
  * ========================================================================== */
 
-const ADMIN_NAV = [
-  { to: '/admin', label: 'Overview', end: true },
-  { to: '/admin/orders', label: 'Orders' },
-  { to: '/admin/products', label: 'Products' },
-  { to: '/admin/categories', label: 'Categories' },
-  { to: '/admin/customers', label: 'Customers' },
-  { to: '/admin/coupons', label: 'Coupons' },
-  { to: '/admin/reviews', label: 'Reviews' },
-  { to: '/admin/messages', label: 'Messages' },
-  { to: '/admin/settings', label: 'Store settings' },
-  { to: '/admin/audit', label: 'Audit log' },
+/** Menu entries carry the permission the API requires for that section. */
+const ADMIN_NAV: { to: string; label: string; end?: boolean; perm: string }[] = [
+  { to: '/admin', label: 'Overview', end: true, perm: 'dashboard.view' },
+  { to: '/admin/orders', label: 'Orders', perm: 'orders.view' },
+  { to: '/admin/products', label: 'Products', perm: 'products.view' },
+  { to: '/admin/categories', label: 'Categories', perm: 'products.view' },
+  { to: '/admin/customers', label: 'Customers', perm: 'customers.view' },
+  { to: '/admin/investors', label: 'Investors', perm: 'investors.view' },
+  { to: '/admin/coupons', label: 'Coupons', perm: 'coupons.manage' },
+  { to: '/admin/reviews', label: 'Reviews', perm: 'reviews.manage' },
+  { to: '/admin/messages', label: 'Messages', perm: 'messages.manage' },
+  { to: '/admin/settings', label: 'Store settings', perm: 'settings.view' },
+  { to: '/admin/team', label: 'Admins', perm: 'admins.view' },
+  { to: '/admin/roles', label: 'Roles', perm: 'roles.manage' },
+  { to: '/admin/audit', label: 'Activity log', perm: 'audit.view' },
 ];
+
+/**
+ * The admin can drag the menu into any order they like. The order is stored in
+ * this browser (per account), so it never changes what other admins see and
+ * needs no server round-trip. Unknown/new sections keep their default spot at
+ * the end until the admin drags them.
+ */
+const NAV_ORDER_KEY = 'nivora.admin.nav-order';
+
+function loadNavOrder(key: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function sortNav(items: typeof ADMIN_NAV, order: string[]): typeof ADMIN_NAV {
+  const remaining = new Map(items.map((n) => [n.to, n]));
+  const sorted: typeof ADMIN_NAV = [];
+  for (const to of order) {
+    const item = remaining.get(to);
+    if (item) {
+      sorted.push(item);
+      remaining.delete(to);
+    }
+  }
+  return [...sorted, ...items.filter((n) => remaining.has(n.to))];
+}
 
 function AdminLayout() {
   const { user, logout } = useAuth();
   const settings = useSettings();
-  const isAdmin = user?.role === 'admin';
+  const { has, isSuperAdmin } = usePermissions();
+  const navOrderKey = `${NAV_ORDER_KEY}.${user?.id ?? 'guest'}`;
+  const [order, setOrder] = useState<string[]>(() => loadNavOrder(navOrderKey));
+  const [dragging, setDragging] = useState('');
+  const nav = useMemo(() => sortNav(ADMIN_NAV, order).filter((n) => has(n.perm)), [order, has]);
+
+  function persistNavOrder(next: string[]) {
+    setOrder(next);
+    try {
+      window.localStorage.setItem(navOrderKey, JSON.stringify(next));
+    } catch {
+      // Storage can be blocked (private mode); the order still applies for this visit.
+    }
+  }
+
+  function moveNav(from: string, to: string) {
+    if (!from || from === to) return;
+    const current = sortNav(ADMIN_NAV, order).map((n) => n.to);
+    const fromIndex = current.indexOf(from);
+    const toIndex = current.indexOf(to);
+    if (fromIndex < 0 || toIndex < 0) return;
+    const next = [...current];
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) return;
+    next.splice(toIndex, 0, moved);
+    persistNavOrder(next);
+  }
+
+  function resetNavOrder() {
+    setOrder([]);
+    try {
+      window.localStorage.removeItem(navOrderKey);
+    } catch {
+      // Nothing to clean up if storage is unavailable.
+    }
+  }
+
   return (
     <div className="admin-shell">
       <aside className="admin-side">
@@ -832,15 +940,50 @@ function AdminLayout() {
           <img className="admin-logo" src={`${import.meta.env.BASE_URL}brand/nivora-logo.png`} alt={settings.storeName} />
           <small>Dashboard</small>
         </Link>
-        <nav className="admin-nav">
-          {ADMIN_NAV.filter((n) => n.to !== '/admin/settings' || isAdmin).map((n) => (
-            <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => cx('admin-link', isActive && 'active')}>
-              {n.label}
-            </NavLink>
+        <nav className="admin-nav" aria-label="Dashboard sections">
+          {nav.map((n) => (
+            <div
+              key={n.to}
+              className={cx('admin-nav-item', dragging === n.to && 'is-dragging')}
+              draggable
+              title="Drag to reorder"
+              onDragStart={(e) => {
+                setDragging(n.to);
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', n.to);
+              }}
+              onDragOver={(e) => {
+                if (!dragging) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                moveNav(dragging, n.to);
+              }}
+              onDrop={(e) => e.preventDefault()}
+              onDragEnd={() => setDragging('')}
+            >
+              <span className="nav-grip" aria-hidden>
+                ⠿
+              </span>
+              <NavLink
+                to={n.to}
+                end={n.end}
+                draggable={false}
+                className={({ isActive }) => cx('admin-link', isActive && 'active')}
+              >
+                {n.label}
+              </NavLink>
+            </div>
           ))}
         </nav>
         <div className="admin-side-foot">
-          <span>{user?.name} · {user?.role}</span>
+          <span>
+            {user?.name} · {isSuperAdmin ? 'Main admin' : user?.role}
+          </span>
+          {order.length > 0 && (
+            <button className="nav-reset" onClick={resetNavOrder}>
+              Reset menu order
+            </button>
+          )}
           <a href={STORE_URL}>← Back to storefront</a>
           <button className="admin-link" style={{ border: 0, background: 'none', padding: 0, textAlign: 'left' }} onClick={() => void logout()}>
             Sign out
@@ -1817,7 +1960,7 @@ function AdminOrderPage() {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [adminNote, setAdminNote] = useState('');
-  const isAdmin = user?.role === 'admin';
+  const canPay = Boolean(user?.isSuperAdmin || (user?.permissions ?? []).includes('orders.payment'));
 
   const load = useCallback(() => {
     setLoading(true);
@@ -2038,7 +2181,7 @@ function AdminOrderPage() {
                 </>
               )}
             </dl>
-            {isAdmin ? (
+            {canPay ? (
               <div className="mt">
                 <Field label="Update payment status">
                   <select value={order.payment.status} onChange={(e) => void setPaymentStatus(e.target.value)} disabled={busy}>
@@ -2116,7 +2259,7 @@ function CustomersAdminPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState('');
   const debouncedQ = useDebounced(q, 350);
-  const isAdmin = user?.role === 'admin';
+  const canManage = Boolean(user?.isSuperAdmin || (user?.permissions ?? []).includes('customers.manage'));
 
   const load = useCallback(() => {
     setLoading(true);
@@ -2167,7 +2310,7 @@ function CustomersAdminPage() {
                   <th>Spent</th>
                   <th>Joined</th>
                   <th>Status</th>
-                  {isAdmin && <th>Access</th>}
+                  {canManage && <th>Access</th>}
                 </tr>
               </thead>
               <tbody>
@@ -2184,7 +2327,7 @@ function CustomersAdminPage() {
                     <td>
                       <Badge status={c.isActive ? 'active' : 'inactive'} />
                     </td>
-                    {isAdmin && (
+                    {canManage && (
                       <td>
                         <div className="table-actions">
                           <select
@@ -3032,19 +3175,52 @@ function AuditAdminPage() {
   const [logs, setLogs] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [q, setQ] = useState('');
+  const [action, setAction] = useState('');
+  const debouncedQ = useDebounced(q, 350);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    const search = new URLSearchParams();
+    if (debouncedQ) search.set('q', debouncedQ);
+    if (action) search.set('action', action);
+    api
+      .get<{ logs: AuditEntry[] }>(`/admin/audit?${search.toString()}`)
+      .then((r) => {
+        setLogs(r.logs);
+        setError('');
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Could not load the activity log.'))
+      .finally(() => setLoading(false));
+  }, [debouncedQ, action]);
 
   useEffect(() => {
-    api
-      .get<{ logs: AuditEntry[] }>('/admin/audit')
-      .then((r) => setLogs(r.logs))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Could not load the audit log.'))
-      .finally(() => setLoading(false));
-  }, []);
+    load();
+  }, [load]);
 
   return (
     <>
-      <AdminHeader title="Audit log" subtitle="Every sensitive action, newest first. Admin only." />
+      <AdminHeader title="Activity log" subtitle="Who did what, when — every sensitive action, newest first." />
       <div className="panel">
+        <div className="toolbar">
+          <input
+            placeholder="Search action, admin email or target…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            className="grow"
+          />
+          <select value={action} onChange={(e) => setAction(e.target.value)} style={{ width: 'auto' }}>
+            <option value="">All actions</option>
+            <option value="admin.">Admin accounts</option>
+            <option value="role.">Roles</option>
+            <option value="auth.">Sign-ins</option>
+            <option value="order.">Orders</option>
+            <option value="product.">Products</option>
+            <option value="customer.">Customers</option>
+            <option value="settings.">Settings</option>
+            <option value="coupon.">Coupons</option>
+          </select>
+        </div>
         {loading ? (
           <Spinner />
         ) : error ? (
@@ -3091,6 +3267,640 @@ function AuditAdminPage() {
   );
 }
 
+
+/* =============================================================================
+ * 29. DASHBOARD — TEAM (ADMINS), ROLES AND RBAC
+ * -----------------------------------------------------------------------------
+ * The main admin creates admins, picks a role template, fine-tunes individual
+ * permissions, resets passwords, suspends or deletes accounts. The API checks
+ * the same permission keys, so these screens only shape the UI.
+ * ========================================================================== */
+
+interface PermissionDef {
+  key: string;
+  group: string;
+  label: string;
+}
+
+interface AdminRoleTpl {
+  id: string;
+  name: string;
+  description: string;
+  permissions: string[];
+  isSystem: boolean;
+}
+
+interface StaffAccount {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  role: string;
+  isActive: boolean;
+  isSuperAdmin: boolean;
+  permissions: string[];
+  adminRole: { id: string; name: string } | null;
+  suspendedReason: string;
+  suspendedAt: string | null;
+  lastLoginAt: string | null;
+  createdAt: string | null;
+}
+
+function PermissionGrid({
+  permissions,
+  value,
+  onChange,
+}: {
+  permissions: PermissionDef[];
+  value: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const groups = useMemo(() => {
+    const map = new Map<string, PermissionDef[]>();
+    for (const p of permissions) {
+      const list = map.get(p.group) ?? [];
+      list.push(p);
+      map.set(p.group, list);
+    }
+    return [...map.entries()];
+  }, [permissions]);
+
+  function toggle(key: string) {
+    onChange(value.includes(key) ? value.filter((k) => k !== key) : [...value, key]);
+  }
+
+  return (
+    <div className="perm-groups">
+      {groups.map(([group, items]) => {
+        const keys = items.map((i) => i.key);
+        const allOn = keys.every((k) => value.includes(k));
+        return (
+          <div key={group} className="perm-group">
+            <div className="perm-group-head">
+              <strong>{group}</strong>
+              <button
+                type="button"
+                className="text-btn"
+                onClick={() =>
+                  onChange(
+                    allOn
+                      ? value.filter((k) => !keys.includes(k))
+                      : [...new Set([...value, ...keys])]
+                  )
+                }
+              >
+                {allOn ? 'Clear all' : 'Select all'}
+              </button>
+            </div>
+            {items.map((p) => (
+              <label key={p.key} className="perm-item">
+                <input type="checkbox" checked={value.includes(p.key)} onChange={() => toggle(p.key)} />
+                <span>
+                  {p.label}
+                  <small className="mono perm-key">{p.key}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+interface AdminDraft {
+  id?: string;
+  name: string;
+  email: string;
+  phone: string;
+  password: string;
+  roleId: string;
+  permissions: string[];
+  isActive: boolean;
+}
+
+const newAdminDraft = (): AdminDraft => ({
+  name: '',
+  email: '',
+  phone: '',
+  password: '',
+  roleId: '',
+  permissions: [],
+  isActive: true,
+});
+
+function AdminsAdminPage() {
+  const { user } = useAuth();
+  const { has } = usePermissions();
+  const { notify } = useToast();
+  const [admins, setAdmins] = useState<StaffAccount[]>([]);
+  const [roles, setRoles] = useState<AdminRoleTpl[]>([]);
+  const [catalog, setCatalog] = useState<PermissionDef[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState('');
+  const [draft, setDraft] = useState<AdminDraft | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState('');
+  const [busy, setBusy] = useState('');
+  const canManage = has('admins.manage');
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([
+      api.get<{ admins: StaffAccount[] }>('/admin/admins'),
+      api.get<{ roles: AdminRoleTpl[] }>('/admin/roles'),
+      api.get<{ permissions: PermissionDef[] }>('/admin/permissions'),
+    ])
+      .then(([a, r, p]) => {
+        setAdmins(a.admins);
+        setRoles(r.roles);
+        setCatalog(p.permissions);
+      })
+      .catch((e: unknown) => notify(e instanceof Error ? e.message : 'Could not load admin accounts.', 'error'))
+      .finally(() => setLoading(false));
+  }, [notify]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const visible = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return admins;
+    return admins.filter(
+      (a) =>
+        a.name.toLowerCase().includes(needle) ||
+        a.email.toLowerCase().includes(needle) ||
+        (a.adminRole?.name ?? '').toLowerCase().includes(needle)
+    );
+  }, [admins, q]);
+
+  function edit(a: StaffAccount) {
+    setFormError('');
+    setDraft({
+      id: a.id,
+      name: a.name,
+      email: a.email,
+      phone: a.phone ?? '',
+      password: '',
+      roleId: a.adminRole?.id ?? '',
+      permissions: [...a.permissions],
+      isActive: a.isActive,
+    });
+  }
+
+  async function save() {
+    if (!draft) return;
+    setSaving(true);
+    setFormError('');
+    try {
+      if (draft.id) {
+        await api.patch(`/admin/admins/${draft.id}`, {
+          name: draft.name,
+          email: draft.email,
+          phone: draft.phone,
+          roleId: draft.roleId || null,
+          permissions: draft.permissions,
+          isActive: draft.isActive,
+        });
+      } else {
+        await api.post('/admin/admins', {
+          name: draft.name,
+          email: draft.email,
+          phone: draft.phone,
+          password: draft.password,
+          roleId: draft.roleId || null,
+          permissions: draft.permissions,
+        });
+      }
+      notify(draft.id ? 'Admin account updated.' : 'Admin account created.', 'success');
+      setDraft(null);
+      load();
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : 'Could not save this admin.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function run(a: StaffAccount, action: string, body?: unknown) {
+    setBusy(a.id);
+    try {
+      await api.post(`/admin/admins/${a.id}/${action}`, body);
+      notify('Admin account updated.', 'success');
+      load();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not update this admin.', 'error');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function suspend(a: StaffAccount) {
+    const reason = window.prompt(`Suspend ${a.name}? Their sessions end immediately.\n\nOptional reason:`);
+    if (reason === null) return;
+    await run(a, 'suspend', { reason });
+  }
+
+  async function resetPassword(a: StaffAccount) {
+    const password = window.prompt(`New password for ${a.name} (at least 10 characters, letters and numbers):`);
+    if (!password) return;
+    await run(a, 'password', { password });
+  }
+
+  async function remove(a: StaffAccount) {
+    if (!window.confirm(`Delete ${a.name} (${a.email})? Their access and sessions are removed permanently.`)) return;
+    setBusy(a.id);
+    try {
+      await api.del(`/admin/admins/${a.id}`);
+      notify('Admin account deleted.', 'success');
+      load();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not delete this admin.', 'error');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <>
+      <AdminHeader
+        title="Admins"
+        subtitle="Who can sign in to this dashboard, and exactly what they may do."
+        actions={
+          canManage ? (
+            <Button
+              onClick={() => {
+                setFormError('');
+                setDraft(newAdminDraft());
+              }}
+            >
+              New admin
+            </Button>
+          ) : undefined
+        }
+      />
+      <div className="panel">
+        <div className="toolbar">
+          <input
+            placeholder="Search name, email or role…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            className="grow"
+          />
+        </div>
+        {loading ? (
+          <Spinner />
+        ) : visible.length === 0 ? (
+          <Empty title="No admin accounts" text="Create a teammate and give them only the access they need." />
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Admin</th>
+                  <th>Role</th>
+                  <th>Permissions</th>
+                  <th>Status</th>
+                  <th>Last sign-in</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visible.map((a) => {
+                  const isSelf = a.id === user?.id;
+                  const locked = !canManage || a.isSuperAdmin || isSelf;
+                  return (
+                    <tr key={a.id}>
+                      <td>
+                        <strong>{a.name}</strong>
+                        {a.isSuperAdmin && <span className="pill pill-main">Main admin</span>}
+                        {isSelf && !a.isSuperAdmin && <span className="pill">You</span>}
+                        <div className="muted small">{a.email}</div>
+                        {a.phone && <div className="muted small">{a.phone}</div>}
+                      </td>
+                      <td className="small">
+                        {a.isSuperAdmin ? 'Full system control' : (a.adminRole?.name ?? 'Custom permissions')}
+                      </td>
+                      <td>
+                        <span className="pill">{a.isSuperAdmin ? 'All' : `${a.permissions.length} granted`}</span>
+                      </td>
+                      <td>
+                        <Badge status={a.isActive ? 'active' : 'inactive'} />
+                        {!a.isActive && a.suspendedReason && (
+                          <div className="muted small">{a.suspendedReason}</div>
+                        )}
+                      </td>
+                      <td className="small">{a.lastLoginAt ? dateShort(a.lastLoginAt) : 'Never'}</td>
+                      <td>
+                        <div className="table-actions">
+                          <button className="text-btn" disabled={locked || busy === a.id} onClick={() => edit(a)}>
+                            Edit
+                          </button>
+                          {a.isActive ? (
+                            <button className="text-btn" disabled={locked || busy === a.id} onClick={() => void suspend(a)}>
+                              Suspend
+                            </button>
+                          ) : (
+                            <button
+                              className="text-btn"
+                              disabled={locked || busy === a.id}
+                              onClick={() => void run(a, 'activate')}
+                            >
+                              Activate
+                            </button>
+                          )}
+                          <button
+                            className="text-btn"
+                            disabled={locked || busy === a.id}
+                            onClick={() => void resetPassword(a)}
+                          >
+                            Reset password
+                          </button>
+                          <button className="text-btn danger" disabled={locked || busy === a.id} onClick={() => void remove(a)}>
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <Modal
+        open={!!draft}
+        wide
+        title={draft?.id ? 'Edit admin' : 'New admin account'}
+        onClose={() => setDraft(null)}
+      >
+        {draft && (
+          <form
+            className="stack"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void save();
+            }}
+          >
+            {formError && <div className="alert alert-error">{formError}</div>}
+            <div className="grid-2">
+              <Field label="Full name">
+                <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} required />
+              </Field>
+              <Field label="Email">
+                <input
+                  type="email"
+                  value={draft.email}
+                  onChange={(e) => setDraft({ ...draft, email: e.target.value })}
+                  required
+                />
+              </Field>
+              <Field label="Phone" hint="Optional.">
+                <input value={draft.phone} onChange={(e) => setDraft({ ...draft, phone: e.target.value })} />
+              </Field>
+              {!draft.id && (
+                <Field label="Temporary password" hint="At least 10 characters with a letter and a number.">
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={draft.password}
+                    onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+                    required
+                  />
+                </Field>
+              )}
+              <Field label="Role template" hint="Choosing a role fills the permissions below; you can fine-tune them.">
+                <select
+                  value={draft.roleId}
+                  onChange={(e) => {
+                    const roleId = e.target.value;
+                    const role = roles.find((r) => r.id === roleId);
+                    setDraft({ ...draft, roleId, permissions: role ? [...role.permissions] : draft.permissions });
+                  }}
+                >
+                  <option value="">Custom permissions</option>
+                  {roles.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              {draft.id && (
+                <Field label="Account status">
+                  <select
+                    value={draft.isActive ? 'active' : 'suspended'}
+                    onChange={(e) => setDraft({ ...draft, isActive: e.target.value === 'active' })}
+                  >
+                    <option value="active">Active</option>
+                    <option value="suspended">Suspended</option>
+                  </select>
+                </Field>
+              )}
+            </div>
+            <div>
+              <div className="row-between" style={{ marginBottom: 8 }}>
+                <strong>Permissions</strong>
+                <span className="muted small">{draft.permissions.length} selected</span>
+              </div>
+              <PermissionGrid
+                permissions={catalog}
+                value={draft.permissions}
+                onChange={(permissions) => setDraft({ ...draft, permissions })}
+              />
+            </div>
+            <div className="row" style={{ justifyContent: 'flex-end' }}>
+              <Button type="button" variant="ghost" onClick={() => setDraft(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" loading={saving}>
+                {draft.id ? 'Save changes' : 'Create admin'}
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+    </>
+  );
+}
+
+interface RoleDraft {
+  id?: string;
+  name: string;
+  description: string;
+  permissions: string[];
+}
+
+function RolesAdminPage() {
+  const { notify } = useToast();
+  const [roles, setRoles] = useState<AdminRoleTpl[]>([]);
+  const [catalog, setCatalog] = useState<PermissionDef[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState<RoleDraft | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = useCallback(() => {
+    setLoading(true);
+    Promise.all([
+      api.get<{ roles: AdminRoleTpl[] }>('/admin/roles'),
+      api.get<{ permissions: PermissionDef[] }>('/admin/permissions'),
+    ])
+      .then(([r, p]) => {
+        setRoles(r.roles);
+        setCatalog(p.permissions);
+      })
+      .catch((e: unknown) => notify(e instanceof Error ? e.message : 'Could not load roles.', 'error'))
+      .finally(() => setLoading(false));
+  }, [notify]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function save() {
+    if (!draft) return;
+    setSaving(true);
+    setError('');
+    try {
+      const body = { name: draft.name, description: draft.description, permissions: draft.permissions };
+      if (draft.id) await api.patch(`/admin/roles/${draft.id}`, body);
+      else await api.post('/admin/roles', body);
+      notify(draft.id ? 'Role updated.' : 'Role created.', 'success');
+      setDraft(null);
+      load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not save this role.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove(role: AdminRoleTpl) {
+    if (!window.confirm(`Delete the "${role.name}" role? Admins using it keep their current permissions.`)) return;
+    try {
+      await api.del(`/admin/roles/${role.id}`);
+      notify('Role deleted.', 'success');
+      load();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not delete this role.', 'error');
+    }
+  }
+
+  return (
+    <>
+      <AdminHeader
+        title="Roles"
+        subtitle="Reusable permission sets. Assign one when creating an admin."
+        actions={
+          <Button
+            onClick={() => {
+              setError('');
+              setDraft({ name: '', description: '', permissions: [] });
+            }}
+          >
+            New role
+          </Button>
+        }
+      />
+      <div className="panel">
+        {loading ? (
+          <Spinner />
+        ) : roles.length === 0 ? (
+          <Empty title="No roles yet" text="Create a role such as Order manager or Support agent." />
+        ) : (
+          <div className="role-grid">
+            {roles.map((r) => (
+              <div key={r.id} className="role-card">
+                <div className="row-between">
+                  <h3 style={{ margin: 0 }}>{r.name}</h3>
+                  {r.isSystem && <span className="pill">Built-in</span>}
+                </div>
+                {r.description && <p className="muted small">{r.description}</p>}
+                <div className="chip-row">
+                  {r.permissions.length === 0 ? (
+                    <span className="muted small">No permissions</span>
+                  ) : (
+                    r.permissions.map((p) => (
+                      <span key={p} className="chip mono">
+                        {p}
+                      </span>
+                    ))
+                  )}
+                </div>
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button
+                    className="text-btn"
+                    onClick={() => {
+                      setError('');
+                      setDraft({
+                        id: r.id,
+                        name: r.name,
+                        description: r.description,
+                        permissions: [...r.permissions],
+                      });
+                    }}
+                  >
+                    Edit
+                  </button>
+                  {!r.isSystem && (
+                    <button className="text-btn danger" onClick={() => void remove(r)}>
+                      Delete
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <Modal open={!!draft} wide title={draft?.id ? 'Edit role' : 'New role'} onClose={() => setDraft(null)}>
+        {draft && (
+          <form
+            className="stack"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void save();
+            }}
+          >
+            {error && <div className="alert alert-error">{error}</div>}
+            <div className="grid-2">
+              <Field label="Role name">
+                <input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} required />
+              </Field>
+              <Field label="Description" hint="What is this role for?">
+                <input value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} />
+              </Field>
+            </div>
+            <div>
+              <div className="row-between" style={{ marginBottom: 8 }}>
+                <strong>Permissions</strong>
+                <span className="muted small">{draft.permissions.length} selected</span>
+              </div>
+              <PermissionGrid
+                permissions={catalog}
+                value={draft.permissions}
+                onChange={(permissions) => setDraft({ ...draft, permissions })}
+              />
+            </div>
+            <div className="row" style={{ justifyContent: 'flex-end' }}>
+              <Button type="button" variant="ghost" onClick={() => setDraft(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" loading={saving}>
+                {draft.id ? 'Save role' : 'Create role'}
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+    </>
+  );
+}
 
 function NotFoundPage() {
   return (
@@ -3186,6 +3996,522 @@ function AdminLoginPage() {
  * 30. ROUTER + MOUNT — served by the API at /admin
  * ========================================================================== */
 
+/* =============================================================================
+ * 29. DASHBOARD — INVESTORS
+ * -----------------------------------------------------------------------------
+ * Each investor keeps a ledger, so "how much did they invest" is the sum of
+ * their entries. Totals are computed by the API, never sent by the browser.
+ * ========================================================================== */
+
+interface InvestorEntry {
+  id: string;
+  amount: number;
+  method: string;
+  note: string;
+  investedAt: string | null;
+}
+
+interface Investor {
+  id: string;
+  name: string;
+  phone: string;
+  email: string;
+  company: string;
+  note: string;
+  isActive: boolean;
+  totalInvested: number;
+  investmentCount: number;
+  lastInvestedAt: string | null;
+  investments: InvestorEntry[];
+  createdAt: string | null;
+}
+
+interface InvestorSummary {
+  totalInvested: number;
+  investorCount: number;
+  activeCount: number;
+  lastInvestedAt: string | null;
+}
+
+interface InvestorDraft {
+  id?: string;
+  name: string;
+  phone: string;
+  email: string;
+  company: string;
+  note: string;
+  amount: string;
+  isActive: boolean;
+}
+
+interface InvestmentDraft {
+  investorId: string;
+  investorName: string;
+  amount: string;
+  method: string;
+  note: string;
+  investedAt: string;
+}
+
+const todayInput = (): string => new Date().toISOString().slice(0, 10);
+
+function InvestorsAdminPage() {
+  const { has } = usePermissions();
+  const { notify } = useToast();
+  const canManage = has('investors.manage');
+  const [investors, setInvestors] = useState<Investor[]>([]);
+  const [summary, setSummary] = useState<InvestorSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState('');
+  const search = useDebounced(q);
+  const [draft, setDraft] = useState<InvestorDraft | null>(null);
+  const [investment, setInvestment] = useState<InvestmentDraft | null>(null);
+  const [detail, setDetail] = useState<Investor | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState('');
+
+  const load = useCallback(() => {
+    setLoading(true);
+    const needle = search.trim();
+    api
+      .get<{ investors: Investor[]; summary: InvestorSummary }>(
+        `/admin/investors${needle ? `?q=${encodeURIComponent(needle)}` : ''}`
+      )
+      .then((r) => {
+        setInvestors(r.investors);
+        setSummary(r.summary);
+      })
+      .catch((e: unknown) => notify(e instanceof Error ? e.message : 'Could not load investors.', 'error'))
+      .finally(() => setLoading(false));
+  }, [search, notify]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    if (!draft) return;
+    setSaving(true);
+    setFormError('');
+    try {
+      const payload = {
+        name: draft.name.trim(),
+        phone: draft.phone.trim(),
+        email: draft.email.trim(),
+        company: draft.company.trim(),
+        note: draft.note.trim(),
+        isActive: draft.isActive,
+      };
+      if (draft.id) {
+        await api.patch(`/admin/investors/${draft.id}`, payload);
+        notify('Investor updated.', 'success');
+      } else {
+        const amount = toPoisha(draft.amount || '0');
+        await api.post('/admin/investors', { ...payload, ...(amount > 0 ? { amount } : {}) });
+        notify('Investor added.', 'success');
+      }
+      setDraft(null);
+      load();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Could not save this investor.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addInvestment(e: React.FormEvent) {
+    e.preventDefault();
+    if (!investment) return;
+    const amount = toPoisha(investment.amount);
+    if (amount <= 0) {
+      setFormError('Enter how much was invested.');
+      return;
+    }
+    setSaving(true);
+    setFormError('');
+    try {
+      const r = await api.post<{ investor: Investor }>(`/admin/investors/${investment.investorId}/investments`, {
+        amount,
+        method: investment.method.trim(),
+        note: investment.note.trim(),
+        investedAt: investment.investedAt ? new Date(investment.investedAt).toISOString() : undefined,
+      });
+      notify('Investment recorded.', 'success');
+      setInvestment(null);
+      if (detail?.id === r.investor.id) setDetail(r.investor);
+      load();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Could not record this investment.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeEntry(inv: Investor, entry: InvestorEntry) {
+    if (!window.confirm(`Remove the ${taka(entry.amount)} investment from ${inv.name}?`)) return;
+    try {
+      const r = await api.del<{ investor: Investor }>(`/admin/investors/${inv.id}/investments/${entry.id}`);
+      notify('Investment removed.', 'info');
+      setDetail(r.investor);
+      load();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not remove this investment.', 'error');
+    }
+  }
+
+  async function remove(inv: Investor) {
+    if (!window.confirm(`Delete ${inv.name} and their ${inv.investmentCount} investment record(s)?`)) return;
+    try {
+      await api.del(`/admin/investors/${inv.id}`);
+      notify('Investor deleted.', 'info');
+      if (detail?.id === inv.id) setDetail(null);
+      load();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not delete this investor.', 'error');
+    }
+  }
+
+  return (
+    <>
+      <AdminHeader
+        title="Investors"
+        subtitle="Every investor and how much they have put in."
+        actions={
+          canManage ? (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                setFormError('');
+                setDraft({ name: '', phone: '', email: '', company: '', note: '', amount: '', isActive: true });
+              }}
+            >
+              + New investor
+            </Button>
+          ) : undefined
+        }
+      />
+
+      <div className="stat-grid">
+        <div className="stat">
+          <span>Total invested</span>
+          <strong>{taka(summary?.totalInvested ?? 0)}</strong>
+          <small>Across all investments</small>
+        </div>
+        <div className="stat">
+          <span>Investors</span>
+          <strong>{summary?.investorCount ?? 0}</strong>
+          <small>{summary?.activeCount ?? 0} active</small>
+        </div>
+        <div className="stat">
+          <span>Last investment</span>
+          <strong>{summary?.lastInvestedAt ? dateShort(summary.lastInvestedAt) : '—'}</strong>
+          <small>Most recent entry</small>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="toolbar">
+          <input
+            className="grow"
+            placeholder="Search by name, phone, email or company…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+
+        {loading ? (
+          <Spinner label="Loading investors…" />
+        ) : investors.length === 0 ? (
+          <Empty
+            title={search ? 'No investors match' : 'No investors yet'}
+            text={canManage ? 'Add an investor and record what they invested.' : 'Nothing has been recorded yet.'}
+          />
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Investor</th>
+                  <th>Contact</th>
+                  <th>Invested</th>
+                  <th>Entries</th>
+                  <th>Last investment</th>
+                  <th>Status</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {investors.map((inv) => (
+                  <tr key={inv.id}>
+                    <td>
+                      <strong>{inv.name}</strong>
+                      {inv.company && (
+                        <>
+                          <br />
+                          <span className="muted small">{inv.company}</span>
+                        </>
+                      )}
+                    </td>
+                    <td>
+                      <span className="small">{inv.phone || '—'}</span>
+                      {inv.email && (
+                        <>
+                          <br />
+                          <span className="muted small">{inv.email}</span>
+                        </>
+                      )}
+                    </td>
+                    <td>
+                      <strong>{taka(inv.totalInvested)}</strong>
+                    </td>
+                    <td>{inv.investmentCount}</td>
+                    <td>{inv.lastInvestedAt ? dateShort(inv.lastInvestedAt) : '—'}</td>
+                    <td>
+                      <Badge status={inv.isActive ? 'active' : 'inactive'} />
+                    </td>
+                    <td>
+                      <div className="table-actions">
+                        <button className="text-btn" onClick={() => setDetail(inv)}>
+                          History
+                        </button>
+                        {canManage && (
+                          <button
+                            className="text-btn"
+                            onClick={() => {
+                              setFormError('');
+                              setInvestment({
+                                investorId: inv.id,
+                                investorName: inv.name,
+                                amount: '',
+                                method: '',
+                                note: '',
+                                investedAt: todayInput(),
+                              });
+                            }}
+                          >
+                            + Invest
+                          </button>
+                        )}
+                        {canManage && (
+                          <button
+                            className="text-btn"
+                            onClick={() => {
+                              setFormError('');
+                              setDraft({
+                                id: inv.id,
+                                name: inv.name,
+                                phone: inv.phone,
+                                email: inv.email,
+                                company: inv.company,
+                                note: inv.note,
+                                amount: '',
+                                isActive: inv.isActive,
+                              });
+                            }}
+                          >
+                            Edit
+                          </button>
+                        )}
+                        {canManage && (
+                          <button className="text-btn" style={{ color: 'var(--red)' }} onClick={() => void remove(inv)}>
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <Modal open={!!draft} title={draft?.id ? 'Edit investor' : 'New investor'} onClose={() => setDraft(null)}>
+        {draft && (
+          <form className="stack" onSubmit={save}>
+            {formError && <div className="notice err">{formError}</div>}
+            <div className="form-grid">
+              <Field label="Name">
+                <input
+                  required
+                  minLength={2}
+                  maxLength={120}
+                  value={draft.name}
+                  onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                />
+              </Field>
+              <Field label="Company / group" hint="Optional">
+                <input
+                  maxLength={120}
+                  value={draft.company}
+                  onChange={(e) => setDraft({ ...draft, company: e.target.value })}
+                />
+              </Field>
+              <Field label="Phone">
+                <input
+                  maxLength={30}
+                  value={draft.phone}
+                  onChange={(e) => setDraft({ ...draft, phone: e.target.value })}
+                />
+              </Field>
+              <Field label="Email">
+                <input
+                  type="email"
+                  maxLength={160}
+                  value={draft.email}
+                  onChange={(e) => setDraft({ ...draft, email: e.target.value })}
+                />
+              </Field>
+              {!draft.id && (
+                <Field label="First investment (৳)" hint="Optional — you can add more later">
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={draft.amount}
+                    onChange={(e) => setDraft({ ...draft, amount: e.target.value })}
+                  />
+                </Field>
+              )}
+              <Field label="Note" className="full">
+                <textarea
+                  rows={2}
+                  maxLength={400}
+                  value={draft.note}
+                  onChange={(e) => setDraft({ ...draft, note: e.target.value })}
+                />
+              </Field>
+              <label className="checkbox full">
+                <input
+                  type="checkbox"
+                  checked={draft.isActive}
+                  onChange={(e) => setDraft({ ...draft, isActive: e.target.checked })}
+                />
+                Active investor
+              </label>
+            </div>
+            <div className="form-actions">
+              <Button type="button" variant="ghost" onClick={() => setDraft(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="primary" loading={saving}>
+                {draft.id ? 'Save investor' : 'Add investor'}
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      <Modal open={!!investment} title={`Investment — ${investment?.investorName ?? ''}`} onClose={() => setInvestment(null)}>
+        {investment && (
+          <form className="stack" onSubmit={addInvestment}>
+            {formError && <div className="notice err">{formError}</div>}
+            <div className="form-grid">
+              <Field label="Amount (৳)">
+                <input
+                  required
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  value={investment.amount}
+                  onChange={(e) => setInvestment({ ...investment, amount: e.target.value })}
+                />
+              </Field>
+              <Field label="Date">
+                <input
+                  type="date"
+                  value={investment.investedAt}
+                  onChange={(e) => setInvestment({ ...investment, investedAt: e.target.value })}
+                />
+              </Field>
+              <Field label="Method" hint="bKash, bank, cash…">
+                <input
+                  maxLength={40}
+                  value={investment.method}
+                  onChange={(e) => setInvestment({ ...investment, method: e.target.value })}
+                />
+              </Field>
+              <Field label="Note" className="full">
+                <textarea
+                  rows={2}
+                  maxLength={240}
+                  value={investment.note}
+                  onChange={(e) => setInvestment({ ...investment, note: e.target.value })}
+                />
+              </Field>
+            </div>
+            <div className="form-actions">
+              <Button type="button" variant="ghost" onClick={() => setInvestment(null)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="primary" loading={saving}>
+                Record investment
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      <Modal open={!!detail} title={detail ? `${detail.name} — investment history` : 'History'} onClose={() => setDetail(null)} wide>
+        {detail && (
+          <div className="stack">
+            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
+              <span className="muted small">
+                {detail.company || 'Individual'} · {detail.phone || detail.email || 'No contact'}
+              </span>
+              <strong>Total {taka(detail.totalInvested)}</strong>
+            </div>
+            {detail.note && <p className="muted small">{detail.note}</p>}
+            {detail.investments.length === 0 ? (
+              <Empty title="No investments yet" text="Record the first amount this investor put in." />
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Amount</th>
+                      <th>Method</th>
+                      <th>Note</th>
+                      {canManage && <th />}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detail.investments.map((entry) => (
+                      <tr key={entry.id}>
+                        <td>{dateShort(entry.investedAt ?? undefined)}</td>
+                        <td>
+                          <strong>{taka(entry.amount)}</strong>
+                        </td>
+                        <td>{entry.method || '—'}</td>
+                        <td>{entry.note || '—'}</td>
+                        {canManage && (
+                          <td>
+                            <button
+                              className="text-btn"
+                              style={{ color: 'var(--red)' }}
+                              onClick={() => void removeEntry(detail, entry)}
+                            >
+                              Remove
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </Modal>
+    </>
+  );
+}
+
 function App() {
   return (
     <Routes>
@@ -3198,17 +4524,20 @@ function App() {
           </Protected>
         }
       >
-        <Route index element={<DashboardPage />} />
-        <Route path="orders" element={<OrdersAdminPage />} />
-        <Route path="orders/:id" element={<AdminOrderPage />} />
-        <Route path="products" element={<ProductsAdminPage />} />
-        <Route path="categories" element={<CategoriesAdminPage />} />
-        <Route path="customers" element={<CustomersAdminPage />} />
-        <Route path="coupons" element={<CouponsAdminPage />} />
-        <Route path="reviews" element={<ReviewsAdminPage />} />
-        <Route path="messages" element={<MessagesAdminPage />} />
-        <Route path="settings" element={<SettingsAdminPage />} />
-        <Route path="audit" element={<AuditAdminPage />} />
+        <Route index element={<Permission perm="dashboard.view"><DashboardPage /></Permission>} />
+        <Route path="orders" element={<Permission perm="orders.view"><OrdersAdminPage /></Permission>} />
+        <Route path="orders/:id" element={<Permission perm="orders.view"><AdminOrderPage /></Permission>} />
+        <Route path="products" element={<Permission perm="products.view"><ProductsAdminPage /></Permission>} />
+        <Route path="categories" element={<Permission perm="products.view"><CategoriesAdminPage /></Permission>} />
+        <Route path="customers" element={<Permission perm="customers.view"><CustomersAdminPage /></Permission>} />
+        <Route path="investors" element={<Permission perm="investors.view"><InvestorsAdminPage /></Permission>} />
+        <Route path="coupons" element={<Permission perm="coupons.manage"><CouponsAdminPage /></Permission>} />
+        <Route path="reviews" element={<Permission perm="reviews.manage"><ReviewsAdminPage /></Permission>} />
+        <Route path="messages" element={<Permission perm="messages.manage"><MessagesAdminPage /></Permission>} />
+        <Route path="settings" element={<Permission perm="settings.view"><SettingsAdminPage /></Permission>} />
+        <Route path="team" element={<Permission perm="admins.view"><AdminsAdminPage /></Permission>} />
+        <Route path="roles" element={<Permission perm="roles.manage"><RolesAdminPage /></Permission>} />
+        <Route path="audit" element={<Permission perm="audit.view"><AuditAdminPage /></Permission>} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/admin" replace />} />

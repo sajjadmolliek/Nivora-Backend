@@ -306,6 +306,42 @@ textarea{resize:vertical;min-height:96px}
 .admin-link{display:flex;justify-content:space-between;gap:8px;padding:9px 12px;border-radius:6px;font-size:.87rem;color:#E5D2AB}
 .admin-link:hover{background:rgba(251,245,232,.08);color:var(--ivory)}
 .admin-link.active{background:rgba(184,138,69,.22);color:var(--ivory);box-shadow:inset 2px 0 0 var(--gold)}
+.admin-nav-item{display:flex;align-items:center;border-radius:6px}
+.admin-nav-item .admin-link{flex:1;min-width:0}
+.admin-nav-item .nav-grip{opacity:0;cursor:grab;padding:0 3px;color:var(--gold);font-size:.9rem;line-height:1;user-select:none;transition:opacity .15s}
+.admin-nav-item:hover .nav-grip,.admin-nav-item:focus-within .nav-grip{opacity:.85}
+.admin-nav-item.is-dragging{opacity:.45}
+.admin-nav-item.is-dragging .nav-grip{cursor:grabbing}
+.nav-reset{border:0;background:none;padding:0;text-align:left;font-size:.75rem;color:var(--gold);text-decoration:underline;cursor:pointer}
+@media (max-width:900px){
+  .admin-main{padding:20px 16px 50px}
+  .admin-top{margin-bottom:16px}
+  .stat-grid{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .stat{padding:14px}
+  .stat strong{font-size:1.35rem}
+  .panel{padding:16px}
+  .table-wrap{margin:0 -16px;padding:0 16px}
+}
+@media (max-width:640px){
+  .admin-side{padding:12px}
+  .admin-nav{gap:4px}
+  .admin-link{padding:8px 10px;font-size:.82rem}
+  .admin-main{padding:16px 12px 40px}
+  .admin-top{flex-direction:column;align-items:flex-start;gap:10px}
+  .admin-top h1{font-size:1.35rem}
+  .admin-user{width:100%;justify-content:space-between;flex-wrap:wrap}
+  .two-panel,.detail-grid,.stat-grid{grid-template-columns:1fr}
+  .panel-head{flex-direction:column;align-items:flex-start;gap:8px}
+  .toolbar input,.toolbar select,.toolbar .grow{width:100%;min-width:0}
+  .table-wrap{margin:0 -12px;padding:0 12px}
+  .table-actions{gap:10px}
+  .form-grid{grid-template-columns:1fr}
+  .variant-row{grid-template-columns:1fr 1fr}
+  .zone-row{grid-template-columns:1fr 96px 34px}
+  .modal-body{padding:16px}
+  .kv{grid-template-columns:110px 1fr}
+  .toasts{left:12px;right:12px;max-width:none}
+}
 .admin-side-foot{margin-top:auto;padding:14px 10px 0;border-top:1px solid rgba(184,138,69,.35);font-size:.78rem;color:#E5D2AB;display:grid;gap:8px}
 .admin-side-foot a{color:var(--ivory)}
 .admin-main{padding:26px clamp(18px,3vw,38px) 60px;min-width:0}
@@ -473,3 +509,20 @@ tbody tr:hover{background:var(--ivory)}
   .support-fab{align-self:flex-end}
   .support-cover{height:112px}
 }
+
+/* RBAC — permission picker, roles, admin accounts */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px 16px}
+@media (max-width:720px){.grid-2{grid-template-columns:1fr}}
+.perm-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.perm-group{border:1px solid var(--beige);border-radius:10px;padding:10px 12px;background:var(--white)}
+.perm-group-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}
+.perm-item{display:flex;gap:8px;align-items:flex-start;font-size:.85rem;padding:4px 0;cursor:pointer}
+.perm-item input{margin-top:3px}
+.perm-key{display:block;color:var(--muted);font-size:.7rem}
+.pill{display:inline-flex;align-items:center;margin-left:8px;border-radius:999px;background:var(--sand);color:var(--ink-2);padding:2px 9px;font-size:.68rem;font-weight:600;vertical-align:middle}
+.pill-main{background:var(--green);color:var(--ivory)}
+.role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.role-card{border:1px solid var(--beige);border-radius:12px;padding:16px;background:var(--white)}
+.chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{background:var(--sand);border-radius:6px;padding:2px 8px;font-size:.7rem;color:var(--ink-2)}
+.text-btn.danger{color:var(--red);border-color:#E3C3C1}
