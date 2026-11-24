@@ -61,6 +61,15 @@ interface Settings {
   supportMessenger: string;
   supportEmail: string;
   supportCover: string;
+  heroSlides: HeroSlide[];
+}
+
+interface HeroSlide {
+  image: string;
+  color: string;
+  eyebrow: string;
+  title: string;
+  subtitle: string;
 }
 
 interface Image {
@@ -2828,6 +2837,7 @@ function SettingsAdminPage() {
   const [error, setError] = useState('');
   const [coverBusy, setCoverBusy] = useState(false);
   const [coverUrl, setCoverUrl] = useState('');
+  const [slideBusy, setSlideBusy] = useState<number | null>(null);
 
   useEffect(() => {
     api
@@ -2901,6 +2911,49 @@ function SettingsAdminPage() {
     }
   }
 
+  function updateSlide(index: number, patch: Partial<HeroSlide>) {
+    set(
+      'heroSlides',
+      (form?.heroSlides ?? []).map((slide, i) => (i === index ? { ...slide, ...patch } : slide))
+    );
+  }
+
+  function addSlide() {
+    set('heroSlides', [
+      ...(form?.heroSlides ?? []),
+      { image: '', color: '#123B2A', eyebrow: form?.tagline ?? '', title: '', subtitle: '' },
+    ]);
+  }
+
+  function moveSlide(index: number, direction: -1 | 1) {
+    const slides = [...(form?.heroSlides ?? [])];
+    const target = index + direction;
+    const current = slides[index];
+    const swapWith = slides[target];
+    if (!current || !swapWith) return;
+    slides[index] = swapWith;
+    slides[target] = current;
+    set('heroSlides', slides);
+  }
+
+  function removeSlide(index: number) {
+    set('heroSlides', (form?.heroSlides ?? []).filter((_, i) => i !== index));
+  }
+
+  /** Upload one slider picture; the API keeps the bytes and returns a URL. */
+  async function uploadSlideFile(index: number, file: File) {
+    setSlideBusy(index);
+    try {
+      const url = await uploadImageFile(file, 2200);
+      updateSlide(index, { image: url });
+      notify(`Slide ${index + 1} picture uploaded. Save settings to publish it.`, 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Could not upload that picture.', 'error');
+    } finally {
+      setSlideBusy(null);
+    }
+  }
+
   async function save(e: React.FormEvent) {
     e.preventDefault();
     if (!form) return;
@@ -2928,6 +2981,15 @@ function SettingsAdminPage() {
         supportWhatsapp: form.supportWhatsapp,
         supportMessenger: form.supportMessenger,
         supportEmail: form.supportEmail,
+        heroSlides: (form.heroSlides ?? [])
+          .filter((slide) => slide.image.trim())
+          .map((slide) => ({
+            image: slide.image.trim(),
+            color: /^#[0-9a-fA-F]{3,8}$/.test(slide.color.trim()) ? slide.color.trim() : '#123B2A',
+            eyebrow: slide.eyebrow.trim(),
+            title: slide.title.trim(),
+            subtitle: slide.subtitle.trim(),
+          })),
         shippingZones: zones
           .filter((z) => z.district.trim())
           .map((z) => ({ district: z.district.trim(), charge: toPoisha(z.charge) })),
@@ -3096,10 +3158,11 @@ function SettingsAdminPage() {
           </div>
 
           <div className="panel-head mt">
-            <h3>Hero cover picture</h3>
+            <h3>Support card picture</h3>
           </div>
           <p className="muted small">
-            Shown as the large picture in the storefront homepage hero, and at the top of the support card.
+            Shown at the top of the floating support card. The homepage hero uses the slider below; this picture is
+            only the fallback when the slider has no slides.
           </p>
           {form.supportCover ? (
             <div className="cover-preview">
@@ -3143,6 +3206,134 @@ function SettingsAdminPage() {
           </div>
           <p className="field-hint mt">
             Either route stores the picture on your own API (/api/support-cover) — nothing is hotlinked from another host.
+          </p>
+        </div>
+
+        <div className="panel">
+          <div className="panel-head">
+            <h3>Homepage hero slider</h3>
+            <Button type="button" variant="outline" size="sm" onClick={addSlide}>
+              + Add slide
+            </Button>
+          </div>
+          <p className="muted small">
+            Each picture becomes one slide, shown in this order and changed automatically every 15 seconds. Pick the
+            picture's main colour — the hero headline, buttons and badges take that colour while the slide is showing.
+          </p>
+
+          {!(form.heroSlides ?? []).length ? (
+            <div className="notice mt">No slides yet — the storefront shows the default banner.</div>
+          ) : (
+            <div className="slide-list mt">
+              {(form.heroSlides ?? []).map((slide, index) => (
+                <div className="slide-editor" key={index}>
+                  <div className="slide-editor-head">
+                    <span className="slide-number">#{index + 1}</span>
+                    <strong>{slide.title.trim() || 'Untitled slide'}</strong>
+                    <div className="slide-tools">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => moveSlide(index, -1)}
+                        disabled={index === 0}
+                        aria-label={`Move slide ${index + 1} up`}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => moveSlide(index, 1)}
+                        disabled={index === (form.heroSlides ?? []).length - 1}
+                        aria-label={`Move slide ${index + 1} down`}
+                      >
+                        ↓
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn danger"
+                        onClick={() => removeSlide(index)}
+                        aria-label={`Delete slide ${index + 1}`}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="slide-editor-body">
+                    <div className="slide-thumb">
+                      {slide.image ? (
+                        <img src={assetUrl(slide.image)} alt={`Slide ${index + 1}`} />
+                      ) : (
+                        <span>No picture</span>
+                      )}
+                      <label className="btn btn-outline btn-sm slide-upload">
+                        {slideBusy === index ? 'Uploading…' : slide.image ? 'Replace picture' : 'Upload picture'}
+                        <input
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif"
+                          hidden
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = '';
+                            if (file) void uploadSlideFile(index, file);
+                          }}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="slide-fields">
+                      <Field label="Eyebrow" hint="Small line above the headline.">
+                        <input
+                          maxLength={60}
+                          placeholder="Readymade & Unstitched"
+                          value={slide.eyebrow}
+                          onChange={(e) => updateSlide(index, { eyebrow: e.target.value })}
+                        />
+                      </Field>
+                      <Field label="Headline">
+                        <input
+                          maxLength={160}
+                          placeholder="Step into Timeless Elegance"
+                          value={slide.title}
+                          onChange={(e) => updateSlide(index, { title: e.target.value })}
+                        />
+                      </Field>
+                      <Field label="Sub-text" className="full">
+                        <input
+                          maxLength={300}
+                          placeholder="Discover our exclusive collection of premium women's fashion."
+                          value={slide.subtitle}
+                          onChange={(e) => updateSlide(index, { subtitle: e.target.value })}
+                        />
+                      </Field>
+                      <Field label="Main colour" hint="Hero text and buttons use this colour.">
+                        <div className="color-field">
+                          <input
+                            type="color"
+                            value={/^#[0-9a-fA-F]{6}$/.test(slide.color) ? slide.color : '#123B2A'}
+                            onChange={(e) => updateSlide(index, { color: e.target.value })}
+                            aria-label={`Slide ${index + 1} colour`}
+                          />
+                          <input
+                            value={slide.color}
+                            maxLength={20}
+                            onChange={(e) => updateSlide(index, { color: e.target.value })}
+                            placeholder="#123B2A"
+                          />
+                        </div>
+                      </Field>
+                      <Field label="Picture number" hint="Order is set with the ↑ ↓ buttons.">
+                        <input value={`${index + 1} of ${(form.heroSlides ?? []).length}`} readOnly />
+                      </Field>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="field-hint mt">
+            Publish the slider by saving settings at the bottom of this page.
           </p>
         </div>
 

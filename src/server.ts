@@ -500,6 +500,20 @@ const SettingsSchema = new Schema(
     supportWhatsapp: { type: String, default: '', maxlength: 200 },
     supportMessenger: { type: String, default: '', maxlength: 200 },
     supportEmail: { type: String, default: '', maxlength: 120 },
+    // Homepage hero slider. The order of this array is the order shoppers see;
+    // each picture carries its own accent colour so the copy matches the art.
+    heroSlides: {
+      type: [
+        {
+          image: { type: String, default: '', maxlength: 1000 },
+          color: { type: String, default: '#123B2A', maxlength: 20 },
+          eyebrow: { type: String, default: '', maxlength: 60 },
+          title: { type: String, default: '', maxlength: 160 },
+          subtitle: { type: String, default: '', maxlength: 300 },
+        },
+      ],
+      default: [],
+    },
   },
   { timestamps: true }
 );
@@ -819,6 +833,13 @@ async function publicSettings() {
     supportMessenger: s.supportMessenger ?? '',
     supportEmail: s.supportEmail ?? '',
     supportCover: cover ? `/api/support-cover?v=${new Date((cover as { updatedAt: Date }).updatedAt).getTime()}` : '',
+    heroSlides: (s.heroSlides ?? []).map((slide: Record<string, unknown>) => ({
+      image: slide.image ?? '',
+      color: slide.color ?? '#123B2A',
+      eyebrow: slide.eyebrow ?? '',
+      title: slide.title ?? '',
+      subtitle: slide.subtitle ?? '',
+    })),
     freeShippingThreshold: s.freeShippingThreshold,
     codEnabled: s.codEnabled,
     walletEnabled: s.walletEnabled,
@@ -2321,6 +2342,18 @@ api.put('/admin/settings', writeLimiter, can('settings.manage'), asyncRoute(asyn
       supportWhatsapp: z.string().trim().max(200).optional(),
       supportMessenger: z.string().trim().max(200).optional(),
       supportEmail: z.string().trim().max(120).optional(),
+      heroSlides: z
+        .array(
+          z.object({
+            image: z.string().trim().min(1).max(1000),
+            color: z.string().trim().regex(/^#[0-9a-fA-F]{3,8}$/).default('#123B2A'),
+            eyebrow: z.string().trim().max(60).optional().default(''),
+            title: z.string().trim().max(160).optional().default(''),
+            subtitle: z.string().trim().max(300).optional().default(''),
+          })
+        )
+        .max(10)
+        .optional(),
     })
     .parse(req.body);
   const settings = await Settings.findOneAndUpdate({ key: 'site' }, { $set: body }, { new: true, upsert: true });
